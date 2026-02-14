@@ -1,0 +1,127 @@
+name: Deploy Nutanix Resource ( IaC - Terraform/OpenTofu )
+run-name: Deploy Nutanix (IaC) | Run num - ${{ github.run_number }} | Run ID - ${{ github.run_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Clients repo branch
+        required: true
+        default: main
+      target_repo:
+        description: Clients repository (owner/repo)
+        required: true
+        type: string
+        default: k-paris/nutanix-terraform
+      test_run:
+        description: 'Test run (skip Terraform, simulate failure)'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      run_intall_tools:
+        description: 'Run install_tools.sh to ensure dependencies are installed'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+  repository_dispatch:
+    types: [run-nutanix-iac-deploy]
+
+env:
+  FIFO_SERVER_URL: ${{ secrets.FIFO_SERVER_URL || 'http://your-fifo-server:8080' }}
+  TEST_RUN: ${{ github.event.inputs.test_run || github.event.client_payload.test_run || 'true' }} 
+
+jobs:
+  setup-environment:
+    runs-on: ubuntu25
+    outputs:
+      token: ${{ steps.export_token.outputs.token }}
+
+    steps:
+
+      - uses: actions/checkout@v4
+
+      - name: Display Run Mode
+        run: |
+          if [ "$TEST_RUN" == "true" ]; then
+            echo -e "\e[33m========================================\e[0m"
+            echo -e "\e[33m  TEST RUN MODE - Terraform will be skipped\e[0m"
+            echo -e "\e[33m  Simulating: FAILED deployment\e[0m"
+            echo -e "\e[33m========================================\e[0m"
+          else
+            echo -e "\e[32m========================================\e[0m"
+            echo -e "\e[32m  PRODUCTION RUN - Terraform will execute\e[0m"
+            echo -e "\e[32m========================================\e[0m"
+          fi
+
+      - name: Ensure tools are installed (optional)
+        if: github.event.inputs.run_install_tools == 'true' || github.event.client_payload.run_install_tools == 'true'
+        run: |
+          # Make sure the script exists and is executable
+          SCRIPT_PATH="scripts/bash/install_tools_with_status.sh"
+          
+          if [ ! -f "$SCRIPT_PATH" ]; then
+            echo -e "\e[31mERROR: Script not found: $SCRIPT_PATH\e[0m"
+            ls -la scripts/bash/ || echo "Directory not found"
+            exit 1
+          fi
+          
+          chmod +x "$SCRIPT_PATH"
+          
+          # Run install script and capture output
+          OUTPUT=$("$SCRIPT_PATH" 2>&1)
+          echo "$OUTPUT"
+          
+          # Extract JSON results from output
+          JSON_RESULTS=$(echo "$OUTPUT" | sed -n '/=== INSTALLATION_RESULTS_JSON ===/,/=== END_INSTALLATION_RESULTS_JSON ===/p' | grep -v '===' | tr -d '\n' | tr -d ' ')
+          
+          echo ""
+          echo "========================================"
+          echo "       TOOL INSTALLATION SUMMARY"
+          echo "========================================"
+          echo ""
+          
+          # Define symbols
+          CHECK_MARK="✅"
+          CROSS_MARK="❌"
+          
+          # Print table header
+          printf "┌─────────────────────┬────────────┐\n"
+          printf "│ %-19s │ %-10s │\n" "Tool Name" "Status"
+          printf "├─────────────────────┼────────────┤\n"
+          
+          # Parse JSON and print each tool status
+          TOOLS=$(echo "$JSON_RESULTS" | tr '{' '\n' | tr '}' '\n' | tr ',' '\n' | grep ':' | tr -d '"')
+          
+          SUCCESS_COUNT=0
+          FAILED_COUNT=0
+          
+          while IFS=: read -r tool status; do
+            if [ -n "$tool" ] && [ -n "$status" ]; then
+              if [ "$status" == "success" ]; then
+                STATUS_SYMBOL="$CHECK_MARK"
+                SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+              else
+                STATUS_SYMBOL="$CROSS_MARK"
+                FAILED_COUNT=$((FAILED_COUNT + 1))
+              fi
+              printf "│ %-19s │ %-10s │\n" "$tool" "$STATUS_SYMBOL"
+            fi
+          done <<< "$TOOLS"
+          
+          printf "└─────────────────────┴────────────┘\n"
+          
+          echo ""
+          echo "Summary: $SUCCESS_COUNT succeeded, $FAILED_COUNT failed"
+          echo ""
+          
+          if [ $FAILED_COUNT -gt 0 ]; then
+            echo -e "\e[33mWarning: Some tools failed to install\e[0m"
+          else
+            echo -e "\e[32mAll tools installed successfully!\e[0m"
+          fi
