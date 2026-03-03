@@ -1,4 +1,602 @@
 parameters:
+  - name: OPERATION_TYPE
+    type: string
+  - name: RESOURCE_TYPE
+    type: string
+    default: 'vm'
+  - name: IAC_TOOL
+    type: string
+    default: 'OPENTOFU'
+  - name: TEST_RUN
+    type: boolean
+    default: false
+  - name: RESOURCE_CONFIG
+    type: string
+    default: '{}'
+  - name: HOST_UUID
+    type: string
+    default: ''
+  - name: dependsOn
+    type: string
+  # variable group parameters
+  - name: ip_pool_server_url
+    type: string
+  - name: fifo_server_url
+    type: string
+
+
+variables:
+  - name: 
+    value: 'Belfius.CCoE.Nutanix.IaC'
+  - name: nutanix_pipeline_repo_path
+    value: 'Belfius.CCoE.Nutanix.Provisioning'
+
+jobs: 
+
+  - job: ManageResource
+    displayName: 'Manage Resource'
+    dependsOn: ${{ parameters.dependsOn }}
+
+    steps:
+      # Get IP Address (for create operation)
+      - task: Bash@3
+        displayName: 'Get IP Address'
+        # this step only runs if operation type is create and resource type is vm, 
+        # since for modify/delete we don't need to reserve IP and can proceed directly to update the tf.json
+        condition: and(eq('${{ parameters.OPERATION_TYPE }}', 'CREATE'), eq('${{ parameters.RESOURCE_TYPE }}', 'vm'))
+        name: get_ip
+        env:
+          IP_POOL_SERVER_URL: $(ip_pool_server_url)
+        inputs:
+          targetType: 'inline'
+          script: |
+            echo "========================================"
+            echo "  Requesting IP Address from Pool"
+            echo "========================================"
+
+            # ==================  TEST MODE SIMULATION ==================
+
+            # if TEST_RUN is true, we will simulate the IP address reservation and return a dummy IP address without making an actual API call
+            if [ "${{ parameters.TEST_RUN }}" == "true" ]; then
+              echo -e "\e[33m⚠️  TEST MODE ENABLED - Simulating IP address reservation\e[0m"
+              SIMULATED_IP="192.168.1.$((RANDOM % 254 + 1))"
+              echo "##vso[task.setvariable variable=IP_ADDRESS;isOutput=true]$SIMULATED_IP"
+              echo -e "\e[32m✅ Simulated IP Address reserved: $SIMULATED_IP\e[0m"
+              exit 0
+            fi
+
+            # ==================  END TEST MODE SIMULATION ==================
+            
+            RUN_ID="run_id_$(Build.BuildId)"
+            
+            # Display input parameters - for debugging
+            echo "IP Pool Server: $IP_POOL_SERVER"
+            echo "Run ID: $RUN_ID"
+            echo ""
+            
+            RESPONSE=$(curl -s -X POST \
+                -H "Content-Type: application/json" \
+                -d "{\"run_id\": \"run_id_$RUN_ID\"}" \
+                "$IP_POOL_SERVER/get_ip")
+              
+              echo "Response: $RESPONSE"
+              
+              IP_ADDRESS=$(echo "$RESPONSE" | jq -r '.ip_address // ""')
+              ERROR=$(echo "$RESPONSE" | jq -r '.error // ""')
+              
+              if [ -n "$ERROR" ] && [ "$ERROR" != "" ]; then
+                echo -e "\e[31mFailed to get IP address: $ERROR\e[0m"
+                exit 1
+              fi
+              
+              if [ -z "$IP_ADDRESS" ] || [ "$IP_ADDRESS" == "null" ]; then
+                echo -e "\e[31mNo IP address returned\e[0m"
+                exit 1
+              fi
+            
+            echo ""
+            echo "##vso[task.setvariable variable=IP_ADDRESS;isOutput=true]$IP_ADDRESS"
+            echo -e "\e[32m✅ IP Address reserved: $IP_ADDRESS\e[0m"
+
+      # Register FIFO Queue and Wait for Turn
+      - task: Bash@3
+        # if operation_type is create and resource_type is vm it depends on get_ip job, otherwise it depends on nothing and will run immediately, 
+        # since for modify/delete we don't need to wait for IP reservation and can proceed directly to update the tf.json
+        dependsOn:
+          - ${{ if and(eq(parameters.OPERATION_TYPE, 'CREATE'), eq(parameters.RESOURCE_TYPE, 'vm')) }}:
+              - get_ip
+        displayName: 'Register FIFO Queue and Wait for Turn'
+        name: fifo_register
+        env:
+          FIFO_SERVER_URL: $(fifo_server_url)
+        inputs:
+          targetType: 'inline'
+          script: |
+            echo "========================================"
+            echo "  Registering with FIFO Queue"
+            echo "========================================"
+
+            # ==================  TEST MODE SIMULATION ==================
+
+            # In test mode, we will skip the actual FIFO registration and simulate being first in queue
+            if [ "${{ parameters.TEST_RUN }}" == "true" ]; then
+              echo -e "\e[33m⚠️  TEST MODE ENABLED - Simulating FIFO queue registration\e[0m"
+              echo "##vso[task.setvariable variable=FIFO_REGISTERED;isOutput=true]true"
+              echo -e "\e[32m✅ Simulated FIFO queue registration complete\e[0m"
+              exit 0
+            fi
+            
+            # ==================  END TEST MODE SIMULATION ==================
+
+            MAX_ATTEMPTS=300  # 300 * 2 sec = 10 minutes max wait
+              ATTEMPT=0
+              
+              while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+                ATTEMPT=$((ATTEMPT + 1))
+                
+                # Send register request
+                RESPONSE=$(curl -s -X POST \
+                  -H "Content-Type: application/json" \
+                  -d "{\"id\": \"$RUN_ID\", \"action\": \"register\"}" \
+                  "$FIFO_SERVER_URL/repo-fifo" 2>&1) || true
+                
+                echo "Attempt $ATTEMPT: Response: $RESPONSE"
+                
+                # Parse response
+                IS_FIRST=$(echo "$RESPONSE" | jq -r '.is_first // false')
+                POSITION=$(echo "$RESPONSE" | jq -r '.position // 0')
+                STATUS=$(echo "$RESPONSE" | jq -r '.status // "error"')
+                
+                if [ "$STATUS" == "error" ]; then
+                  echo -e "\e[31mFIFO server error, retrying...\e[0m"
+                  sleep 2
+                  continue
+                fi
+                
+                echo "Status: $STATUS, Position: $POSITION, IsFirst: $IS_FIRST"
+                
+                if [ "$IS_FIRST" == "true" ]; then
+                  echo -e "\e[32mThis run is first in queue! Proceeding...\e[0m"
+                  break
+                else
+                  echo "Waiting in queue at position $POSITION... (attempt $ATTEMPT)"
+                  sleep 2
+                fi
+              done
+              
+              if [ "$IS_FIRST" != "true" ]; then
+                echo -e "\e[31mTimeout waiting for turn in Repo-FIFO queue\e[0m"
+                # Deregister before failing
+                curl -s -X POST \
+                  -H "Content-Type: application/json" \
+                  -d "{\"id\": \"$RUN_ID\", \"action\": \"deregister\"}" \
+                  "$FIFO_SERVER_URL/repo-fifo" || true
+                exit 1
+              fi
+            
+            echo "##vso[task.setvariable variable=FIFO_REGISTERED;isOutput=true]true"
+            echo -e "\e[32m✅ FIFO queue registration complete\e[0m"
+
+      # Checkout IaC_Nutanix repository
+      - checkout: self
+        name: checkout_iac
+        dependsOn: fifo_register
+        displayName: 'Checkout IaC_Nutanix'
+        path: 'IaC_Nutanix'
+
+      # Add resource config to IaC JSON (Create)
+      - task: Bash@3
+        dependsOn: checkout_iac
+        displayName: 'Add Resource Config to IaC JSON'
+        condition: eq('${{ parameters.OPERATION_TYPE }}', 'CREATE')
+        env:
+          IP_ADDRESS: $(get_ip.IP_ADDRESS)
+        inputs:
+          targetType: 'inline'
+          workingDirectory: '$(Pipeline.Workspace)/IaC_Nutanix'
+          script: |
+            echo "========================================"
+            echo "  Adding Resource to IaC JSON"
+            echo "========================================"
+            
+            RESOURCE_CONFIG='${{ parameters.RESOURCE_CONFIG }}'
+            RESOURCE_TYPE="${{ parameters.RESOURCE_TYPE }}"
+            
+            echo "Updating $RESOURCE_TYPE.tf.json with new resource configuration..."
+            echo "Reserved IP Address: $IP_ADDRESS"
+              
+            # Write JSON to temp file to avoid shell escaping issues
+            echo "$RESOURCE_CONFIG" > /tmp/resource_config.json
+              
+            # Debug: Show temp file content
+            echo "=== Temp file content ==="
+            cat /tmp/resource_config.json
+            echo "=== End temp file content ==="
+              
+            # Debug: Show directory structure
+            echo "=== Directory structure ==="
+            ls -la terraform-template/
+            echo "=== End directory structure ==="
+              
+            # Build command with optional IP address
+            CMD="python3 scripts/python/tf_json_add.py \
+              --resource-type \"$RESOURCE_TYPE\" \
+              --ip-address \"$IP_ADDRESS\" \
+              --resource-config-file /tmp/resource_config.json \
+              --tf-dir \"terraform-template\""
+              
+              
+            # Run update script
+            echo "=== Running Python script ==="
+            echo "Command: $CMD"
+            eval $CMD && SCRIPT_SUCCESS=true || SCRIPT_SUCCESS=false
+            echo "=== End Python script output ==="
+              
+            echo "Script success: $SCRIPT_SUCCESS"
+              
+            if [ "$SCRIPT_SUCCESS" == "true" ]; then
+              echo -e "\e[32mSuccessfully updated $RESOURCE_TYPE.tf.json\e[0m"
+                
+              # Show updated file content for debugging
+              echo "Updated $RESOURCE_TYPE.tf.json:"
+              cat "terraform-template/$RESOURCE_TYPE.tf.json"
+            else
+              echo -e "\e[31mFailed to update tf.json\e[0m"
+              exit 1
+            fi
+              
+            # Cleanup
+            rm -f /tmp/resource_config.json
+            
+            echo -e "\e[32m✅ Resource added to IaC JSON\e[0m"
+
+      # Modify resource in IaC JSON (Modify)
+      - task: Bash@3
+        dependsOn: checkout_iac
+        displayName: 'Modify Resource in IaC JSON'
+        condition: eq('${{ parameters.OPERATION_TYPE }}', 'MODIFY')
+        inputs:
+          targetType: 'inline'
+          workingDirectory: '$(Pipeline.Workspace)/IaC_Nutanix'
+          script: |
+            echo "========================================"
+            echo "  Modifying Resource in IaC JSON"
+            echo "========================================"
+            
+            RESOURCE_CONFIG='${{ parameters.RESOURCE_CONFIG }}'
+            RESOURCE_TYPE="${{ parameters.RESOURCE_TYPE }}"
+
+            echo "Modifying $RESOURCE_TYPE.tf.json with resource configuration..."
+              
+            # Write JSON to temp file to avoid shell escaping issues
+            echo "$RESOURCE_CONFIG" > /tmp/resource_config.json
+              
+            # Debug: Show what we're updating
+            echo "=== New config to merge ==="
+            cat /tmp/resource_config.json
+            echo "=== End new config ==="
+              
+            # Run update script
+            echo "=== Running Python script ==="
+            python3 scripts/python/tf_json_update.py \
+              --resource-type "$RESOURCE_TYPE" \
+              --resource-config-file /tmp/resource_config.json \
+              --tf-dir "terraform-template" && SCRIPT_SUCCESS=true || SCRIPT_SUCCESS=false
+            echo "=== End Python script output ==="
+              
+            if [ "$SCRIPT_SUCCESS" == "true" ]; then
+              echo -e "\e[32mSuccessfully modified $RESOURCE_TYPE.tf.json\e[0m"
+                
+              # Show updated file content
+              echo "Updated $RESOURCE_TYPE.tf.json:"
+              cat "terraform-template/$RESOURCE_TYPE.tf.json"
+            else
+              echo -e "\e[31mFailed to modify tf.json\e[0m"
+              exit 1
+            fi
+              
+            # Cleanup
+            rm -f /tmp/resource_config.json
+            
+            echo -e "\e[32m✅ Resource modified in IaC JSON\e[0m"
+
+      # Delete resource from IaC JSON (Delete)
+      - task: Bash@3
+        dependsOn: checkout_iac
+        condition: eq('${{ parameters.OPERATION_TYPE }}', 'DELETE')
+        inputs:
+          targetType: 'inline'
+          workingDirectory: '$(Pipeline.Workspace)/IaC_Nutanix'
+          script: |
+            echo "========================================"
+            echo "  Deleting Resource from IaC JSON"
+            echo "========================================"
+            
+            RESOURCE_CONFIG='${{ parameters.RESOURCE_CONFIG }}'
+            RESOURCE_TYPE="${{ parameters.RESOURCE_TYPE }}"
+            
+            # Write JSON to temp file to avoid shell escaping issues
+            echo "$RESOURCE_CONFIG" > /tmp/resource_config.json
+              
+            # Run delete script
+            echo "=== Running Python script ==="
+            python3 scripts/python/tf_json_delete.py \
+              --resource-type "$RESOURCE_TYPE" \
+              --resource-config-file /tmp/resource_config.json \
+              --tf-dir "terraform-template" && SCRIPT_SUCCESS=true || SCRIPT_SUCCESS=false
+            echo "=== End Python script output ==="
+              
+            if [ "$SCRIPT_SUCCESS" == "true" ]; then
+              echo -e "\e[32mSuccessfully deleted resource from $RESOURCE_TYPE.tf.json\e[0m"
+                
+              # Show updated file content
+              echo "Updated $RESOURCE_TYPE.tf.json:"
+              cat "terraform-template/$RESOURCE_TYPE.tf.json"
+            else
+              echo -e "\e[31mFailed to delete resource from tf.json\e[0m"
+              exit 1
+            fi
+              
+            # Cleanup
+            rm -f /tmp/resource_config.json
+            
+            echo -e "\e[32m✅ Resource deleted from IaC JSON\e[0m"
+
+      # Run OpenTofu
+      - task: Bash@3
+        # this can run only if either  create/modify/delete operation is successful, otherwise we might be trying to apply with invalid config which can cause issues
+        displayName: 'Run OpenTofu'
+        condition: and(eq('${{ parameters.IAC_TOOL }}', 'OPENTOFU'), eq('${{ parameters.TEST_RUN }}', 'false'), succeeded())
+        name: opentofu
+        inputs:
+          targetType: 'inline'
+          workingDirectory: '$(Pipeline.Workspace)/IaC_Nutanix/Terraform'
+          script: |
+            echo "========================================"
+            echo "  Running OpenTofu"
+            echo "========================================"
+            
+            # Initialize
+            echo "Initializing OpenTofu..."
+            tofu init -input=false
+            
+            # Validate
+            echo ""
+            echo "Validating configuration..."
+            tofu validate
+            
+            # Plan
+            echo ""
+            echo "Creating execution plan..."
+            tofu plan -out=tfplan
+            
+            # Apply
+            echo ""
+            echo "Applying changes..."
+            tofu apply -auto-approve tfplan
+            
+            echo ""
+            echo "##vso[task.setvariable variable=DEPLOY_STATUS;isOutput=true]succeeded"
+            echo -e "\e[32m✅ OpenTofu apply completed successfully\e[0m"
+        env:
+          NUTANIX_USERNAME: $(NUTANIX_USERNAME)
+          NUTANIX_PASSWORD: $(NUTANIX_PASSWORD)
+          NUTANIX_ENDPOINT: $(NUTANIX_ENDPOINT)
+          NUTANIX_PORT: $(NUTANIX_PORT)
+          NUTANIX_INSECURE: $(NUTANIX_INSECURE)
+
+      # Run Terraform
+      - task: Bash@3
+        displayName: 'Run Terraform'
+        condition: and(eq('${{ parameters.IAC_TOOL }}', 'TERRAFORM'), eq('${{ parameters.TEST_RUN }}', 'false'), succeeded())
+        name: terraform
+        inputs:
+          targetType: 'inline'
+          workingDirectory: '$(Pipeline.Workspace)/IaC_Nutanix/Terraform'
+          script: |
+            echo "========================================"
+            echo "  Running Terraform"
+            echo "========================================"
+            
+            # Initialize
+            echo "Initializing Terraform..."
+            terraform init -input=false
+            
+            # Validate
+            echo ""
+            echo "Validating configuration..."
+            terraform validate
+            
+            # Plan
+            echo ""
+            echo "Creating execution plan..."
+            terraform plan -out=tfplan
+            
+            # Apply
+            echo ""
+            echo "Applying changes..."
+            terraform apply -auto-approve tfplan
+            
+            echo ""
+            echo "##vso[task.setvariable variable=DEPLOY_STATUS;isOutput=true]succeeded"
+            echo -e "\e[32m✅ Terraform apply completed successfully\e[0m"
+        env:
+          NUTANIX_USERNAME: $(NUTANIX_USERNAME)
+          NUTANIX_PASSWORD: $(NUTANIX_PASSWORD)
+          NUTANIX_ENDPOINT: $(NUTANIX_ENDPOINT)
+          NUTANIX_PORT: $(NUTANIX_PORT)
+          NUTANIX_INSECURE: $(NUTANIX_INSECURE)
+
+      # Simulate IaC Tool Run (Test Mode)
+      - task: Bash@3
+        displayName: 'Simulate IaC Tool Run (Test Mode)'
+        condition: eq('${{ parameters.TEST_RUN }}', 'true')
+        name: test_mode
+        inputs:
+          targetType: 'inline'
+          workingDirectory: '$(Pipeline.Workspace)/IaC_Nutanix/Terraform'
+          script: |
+            echo "========================================"
+            echo "  SIMULATING IaC Tool Run (Test Mode)"
+            echo "========================================"
+            echo ""
+            echo -e "\e[33m⚠️  TEST MODE ENABLED - No actual changes will be made\e[0m"
+            echo ""
+            
+            echo "Would run: ${{ parameters.IAC_TOOL }}"
+            echo "Operation: ${{ parameters.OPERATION_TYPE }}"
+            echo "Resource Type: ${{ parameters.RESOURCE_TYPE }}"
+            echo ""
+            
+            # Simulate plan output
+            echo "Simulated Plan Output:"
+            echo "----------------------------------------"
+            echo "+ nutanix_virtual_machine.vm"
+            echo "    name: ${{ parameters.VM_NAME }}"
+            echo "    (simulated changes would appear here)"
+            echo "----------------------------------------"
+            echo ""
+            
+            echo "##vso[task.setvariable variable=DEPLOY_STATUS;isOutput=true]simulated"
+            echo -e "\e[33m⚠️ Test mode - deployment simulated\e[0m"
+
+      # Commit and Push Changes
+      - task: Bash@3
+        displayName: 'Commit and Push Changes'
+        condition: and(succeeded(), eq('${{ parameters.TEST_RUN }}', 'false'))
+        inputs:
+          targetType: 'inline'
+          workingDirectory: '$(Pipeline.Workspace)/IaC_Nutanix'
+          script: |
+            echo "========================================"
+            echo "  Committing and Pushing Changes - DRAFT"
+            echo "========================================"
+            
+            # Configure git
+            git config user.email "azure-pipeline@nutanix.local"
+            git config user.name "Azure Pipeline"
+            
+            # Check for changes
+            if git diff --quiet && git diff --staged --quiet; then
+              echo "No changes to commit"
+            else
+              # Add changes
+              git add -A
+              
+              # Commit
+              COMMIT_MSG="[${{ parameters.OPERATION_TYPE }}] ${{ parameters.RESOURCE_TYPE }} - ${{ parameters.VM_NAME }} - Build $(Build.BuildId)"
+              git commit -m "$COMMIT_MSG"
+              
+              # Push changes
+              git push origin HEAD:$(Build.SourceBranchName)
+              
+              echo -e "\e[32m✅ Changes committed and pushed\e[0m"
+            fi
+
+      # Deregister from FIFO Queue
+      - task: Bash@3
+        displayName: 'Deregister from FIFO Queue'
+        condition: always()
+        inputs:
+          targetType: 'inline'
+          script: |
+            echo "========================================"
+            echo "  Deregistering from FIFO Queue"
+            echo "========================================"
+
+            # ==================  TEST MODE SIMULATION ==================
+
+            # In test mode, we will skip the actual FIFO deregistration and simulate it
+            if [ "${{ parameters.TEST_RUN }}" == "true" ]; then
+              echo -e "\e[33m⚠️  TEST MODE ENABLED - Simulating FIFO queue deregistration\e[0m"
+              echo -e "\e[32m✅ Simulated FIFO queue deregistration complete\e[0m"
+              exit 0
+            fi
+
+            # ==================  END TEST MODE SIMULATION ==================
+            
+            FIFO_SERVER_URL="$(FIFO_SERVER_URL)"
+            RUN_ID="run_id_$(Build.BuildId)"
+            
+            # Deregister from FIFO queue
+            RESPONSE=$(curl -s -X POST \
+              -H "Content-Type: application/json" \
+              -d "{\"run_id\": \"$RUN_ID\"}" \
+              "$FIFO_SERVER_URL/deregister" 2>/dev/null || echo '{"status": "simulated"}')
+            
+            echo "Deregister Response: $RESPONSE"
+            echo -e "\e[32m✅ Deregistered from FIFO queue\e[0m"
+
+      # Update IP Address Status
+      - task: Bash@3
+        displayName: 'Update IP Address Status'
+        condition: always()
+        inputs:
+          targetType: 'inline'
+          script: |
+            echo "========================================"
+            echo "  Updating IP Address Status"
+            echo "========================================"
+
+            # ==================  TEST MODE SIMULATION ==================
+
+            # In test mode, we will skip the actual API call and simulate it
+            if [ "${{ parameters.TEST_RUN }}" == "true" ]; then
+              echo -e "\e[33m⚠️  TEST MODE ENABLED - Simulating IP address status update\e[0m"
+              echo -e "\e[32m✅ Simulated IP address status update complete\e[0m"
+              exit 0
+            fi
+            
+            # ==================  END TEST MODE SIMULATION ==================
+            
+            IP_POOL_SERVER="$(IP_POOL_SERVER_URL)"
+            OPERATION_TYPE="${{ parameters.OPERATION_TYPE }}"
+            VM_NAME="${{ parameters.VM_NAME }}"
+            RUN_ID="run_id_$(Build.BuildId)"
+            
+            # Get deployment status from previous steps
+            DEPLOY_STATUS="unknown"
+            if [ "${{ parameters.TEST_RUN }}" == "true" ]; then
+              DEPLOY_STATUS="simulated"
+            elif [ -n "$(opentofu.DEPLOY_STATUS)" ]; then
+              DEPLOY_STATUS="$(opentofu.DEPLOY_STATUS)"
+            elif [ -n "$(terraform.DEPLOY_STATUS)" ]; then
+              DEPLOY_STATUS="$(terraform.DEPLOY_STATUS)"
+            fi
+            
+            echo "Operation Type: $OPERATION_TYPE"
+            echo "VM Name: $VM_NAME"
+            echo "Deployment Status: $DEPLOY_STATUS"
+            
+            if [ "$OPERATION_TYPE" == "delete" ]; then
+              echo ""
+              echo "=== DELETE operation: Releasing IP address ==="
+              
+              if [ "$DEPLOY_STATUS" == "succeeded" ]; then
+                RESPONSE=$(curl -s -X POST \
+                  -H "Content-Type: application/json" \
+                  -d "{\"operation_type\": \"delete\", \"vm_name\": \"$VM_NAME\"}" \
+                  "$IP_POOL_SERVER/release_ip" 2>/dev/null || echo '{"status": "simulated"}')
+                
+                echo "Response: $RESPONSE"
+              fi
+              
+            elif [ "$OPERATION_TYPE" == "create" ]; then
+              echo ""
+              echo "=== CREATE operation: Updating IP status ==="
+              
+              IP_ADDRESS="$(get_ip.IP_ADDRESS)"
+              
+              RESPONSE=$(curl -s -X POST \
+                -H "Content-Type: application/json" \
+                -d "{\"run_id\": \"$RUN_ID\", \"deployment_status\": \"$DEPLOY_STATUS\", \"ip_address\": \"$IP_ADDRESS\", \"vm_name\": \"$VM_NAME\"}" \
+                "$IP_POOL_SERVER/update_ip" 2>/dev/null || echo '{"status": "simulated"}')
+              
+              echo "Response: $RESPONSE"
+            fi
+            
+            echo ""
+            echo -e "\e[32m✅ IP Address status updated\e[0m"
   
 
         
