@@ -48,25 +48,6 @@ parameters:
     type: boolean
     default: false
 
-  # CyberArk parameters for Nutanix authentication (only used when use_cyberArk = true)
-  - name: CYBERARK_CCP_URL
-    type: string
-    default: ''
-  - name: CYBERARK_APP_ID
-    type: string
-    default: ''
-  - name: CYBERARK_SAFE
-    type: string
-    default: ''
-  - name: CYBERARK_OBJECT
-    type: string
-    default: ''
-  - name: NUTANIX_CLUSTER_URL
-    type: string
-    default: ''
-  - name: CYBERARK_CLIENT_CERT_PATH
-    type: string
-    default: ''
   - name: TEST_RUN
     type: boolean
     default: true
@@ -78,13 +59,16 @@ pool: self-hosted-ubuntu
 
 name: 'VM Resize | ${{ coalesce(parameters.VM_NAME, parameters.VM_UUID) }} | CPU:${{ parameters.DESIRED_CPU }} RAM:${{ parameters.MEMORY_SIZE_GB }}GB'
 
-# When use_cyberArk = false, credentials are pulled from this variable group
-# (PRISM_USERNAME, PRISM_PASSWORD, PRISM_ELEMENT_FQDN). They are remapped onto
-# NUTANIX_USERNAME / NUTANIX_PASSWORD / NUTANIX_ENDPOINT at job scope below so
-# that the bash steps stay identical regardless of the credential source.
+# Credentials and CyberArk configuration are pulled from this variable group:
+#   - When use_cyberArk = false: PRISM_USERNAME, PRISM_PASSWORD, PRISM_ELEMENT_FQDN
+#   - When use_cyberArk = true:  CYBERARK_CCP_URL, CYBERARK_APP_ID, CYBERARK_SAFE,
+#                                CYBERARK_OBJECT, NUTANIX_CLUSTER_URL,
+#                                CYBERARK_CLIENT_CERT_PATH
+# In both cases values are remapped onto NUTANIX_USERNAME / NUTANIX_PASSWORD /
+# NUTANIX_ENDPOINT at job scope below so that the bash steps stay identical
+# regardless of the credential source.
 variables:
-  - ${{ if eq(parameters.use_cyberArk, false) }}:
-      - group: ccoe-nutanix-automation
+  - group: ccoe-nutanix-automation
 
 
 stages:
@@ -94,17 +78,66 @@ stages:
     jobs:
 
       # ----------------------------------------------------------------------------------------------
-      # 1) (Optional until CyberArk integration is complete) Fetch Nutanix credentials from CyberArk
+      # 1) Validate input parameters (DESIRED_CPU / MEMORY_SIZE_GB)
+      # ----------------------------------------------------------------------------------------------
+      - job: ValidateInputParameters
+        displayName: 'Validate Input Parameters'
+        steps:
+          - bash: |
+              set -e
+
+              DESIRED_CPU="${{ parameters.DESIRED_CPU }}"
+              MEMORY_GB="${{ parameters.MEMORY_SIZE_GB }}"
+
+              echo "Provided DESIRED_CPU:    '${DESIRED_CPU}'"
+              echo "Provided MEMORY_SIZE_GB: '${MEMORY_GB}'"
+
+              # At least one of the two must be provided
+              if [ -z "$DESIRED_CPU" ] && [ -z "$MEMORY_GB" ]; then
+                echo "##vso[task.logissue type=error]At least one of DESIRED_CPU or MEMORY_SIZE_GB must be specified"
+                exit 1
+              fi
+
+              # Helper: validate a value is a positive integer
+              is_positive_integer() {
+                case "$1" in
+                  ''|*[!0-9]*) return 1 ;;
+                  0) return 1 ;;
+                  *) return 0 ;;
+                esac
+              }
+
+              if [ -n "$DESIRED_CPU" ]; then
+                if ! is_positive_integer "$DESIRED_CPU"; then
+                  echo "##vso[task.logissue type=error]DESIRED_CPU must be a positive integer (got: '$DESIRED_CPU')"
+                  exit 1
+                fi
+                echo "✅ DESIRED_CPU is valid: $DESIRED_CPU"
+              fi
+
+              if [ -n "$MEMORY_GB" ]; then
+                if ! is_positive_integer "$MEMORY_GB"; then
+                  echo "##vso[task.logissue type=error]MEMORY_SIZE_GB must be a positive integer (got: '$MEMORY_GB')"
+                  exit 1
+                fi
+                echo "✅ MEMORY_SIZE_GB is valid: $MEMORY_GB"
+              fi
+
+              echo "✅ Input parameter validation passed"
+            displayName: 'Validate DESIRED_CPU and MEMORY_SIZE_GB'
+
+      # ----------------------------------------------------------------------------------------------
+      # 2) (Optional until CyberArk integration is complete) Fetch Nutanix credentials from CyberArk
       # ----------------------------------------------------------------------------------------------
       - ${{ if eq(parameters.use_cyberArk, true) }}:
           - template: ../Templates/cyberarkAuth.yaml
             parameters:
-              cyberark_ccp_url: ${{ parameters.CYBERARK_CCP_URL }}
-              cyberark_app_id: ${{ parameters.CYBERARK_APP_ID }}
-              cyberark_safe: ${{ parameters.CYBERARK_SAFE }}
-              cyberark_object: ${{ parameters.CYBERARK_OBJECT }}
-              nutanix_cluster_url: ${{ parameters.NUTANIX_CLUSTER_URL }}
-              cyberark_client_cert_path: ${{ parameters.CYBERARK_CLIENT_CERT_PATH }}
+              cyberark_ccp_url: $(CYBERARK_CCP_URL)
+              cyberark_app_id: $(CYBERARK_APP_ID)
+              cyberark_safe: $(CYBERARK_SAFE)
+              cyberark_object: $(CYBERARK_OBJECT)
+              nutanix_cluster_url: $(NUTANIX_CLUSTER_URL)
+              cyberark_client_cert_path: $(CYBERARK_CLIENT_CERT_PATH)
               TEST_RUN: ${{ parameters.TEST_RUN }}
 
       # ----------------------------------------------------------------------------------------------
@@ -112,165 +145,10 @@ stages:
       # ----------------------------------------------------------------------------------------------
       - job: ValidateSpec
         displayName: 'Validate current spec'
-        ${{ if eq(parameters.use_cyberArk, true) }}:
-          dependsOn: CyberArkAuth
-        variables:
-          ${{ if eq(parameters.use_cyberArk, true) }}:
-            NUTANIX_USERNAME: $[ dependencies.CyberArkAuth.outputs['retrieveCredentials.NUTANIX_USERNAME'] ]
-            NUTANIX_PASSWORD: $[ dependencies.CyberArkAuth.outputs['retrieveCredentials.NUTANIX_PASSWORD'] ]
-            NUTANIX_ENDPOINT: $[ dependencies.CyberArkAuth.outputs['retrieveCredentials.NUTANIX_ENDPOINT'] ]
-          ${{ else }}:
-            NUTANIX_USERNAME: $(PRISM_USERNAME)
-            NUTANIX_PASSWORD: $(PRISM_PASSWORD)
-            NUTANIX_ENDPOINT: $(PRISM_ELEMENT_FQDN)
-        steps:
-          - ${{ if eq(parameters.LIST_VMS, true) }}:
-              - bash: |
-                  set -e
-
-                  API_URL="https://${NUTANIX_ENDPOINT}:9440/api/nutanix/v3/vms/list"
-
-                  echo "========================================="
-                  echo "  Listing Available VMs"
-                  echo "========================================="
-
-                  RESPONSE=$(curl -s -k -w "\n%{http_code}" \
-                    -X POST \
-                    -H "Content-Type: application/json" \
-                    -u "${NUTANIX_USERNAME}:${NUTANIX_PASSWORD}" \
-                    -d '{
-                      "kind": "vm",
-                      "sort_attribute": "vm_name",
-                      "sort_order": "ASCENDING",
-                      "offset": 0,
-                      "length": 500
-                    }' \
-                    "$API_URL")
-
-                  HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
-                  RESPONSE_BODY=$(echo "$RESPONSE" | sed '$d')
-
-                  if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
-                    echo "##vso[task.logissue type=error]Failed to list VMs (HTTP $HTTP_CODE)"
-                    echo "$RESPONSE_BODY" | jq '.' 2>/dev/null || echo "$RESPONSE_BODY"
-                    exit 1
-                  fi
-
-                  ENTITY_COUNT=$(echo "$RESPONSE_BODY" | jq -r '.entities | if type=="array" then length else 0 end')
-                  if [ "$ENTITY_COUNT" -eq 0 ]; then
-                    echo "No VMs found."
-                    exit 0
-                  fi
-
-                  echo "$RESPONSE_BODY" | jq -r '.entities[] |
-                    "Name: \(.spec.name)\n" +
-                    "UUID: \(.metadata.uuid)\n" +
-                    "vCPUs: \(.spec.resources.num_sockets * .spec.resources.num_vcpus_per_socket) (Sockets: \(.spec.resources.num_sockets), vCPUs/socket: \(.spec.resources.num_vcpus_per_socket))\n" +
-                    "Memory: \((.spec.resources.memory_size_mib / 1024) | round)GB\n" +
-                    "Power State: \(.spec.resources.power_state)\n" +
-                    "---"'
-                env:
-                  NUTANIX_ENDPOINT: $(NUTANIX_ENDPOINT)
-                  NUTANIX_USERNAME: $(NUTANIX_USERNAME)
-                  NUTANIX_PASSWORD: $(NUTANIX_PASSWORD)
-                displayName: 'List VMs'
-
-          - bash: |
-              set -e
-
-              VM_NAME="${{ parameters.VM_NAME }}"
-              VM_UUID="${{ parameters.VM_UUID }}"
-              DESIRED_CPU="${{ parameters.DESIRED_CPU }}"
-              MEMORY_GB="${{ parameters.MEMORY_SIZE_GB }}"
-              API_URL="https://${NUTANIX_ENDPOINT}:9440/api/nutanix/v3"
-
-              if [ -z "$VM_NAME" ] && [ -z "$VM_UUID" ]; then
-                echo "##vso[task.logissue type=error]Either VM_NAME or VM_UUID is required"
-                exit 1
-              fi
-
-              if [ -z "$DESIRED_CPU" ] && [ -z "$MEMORY_GB" ]; then
-                echo "##vso[task.logissue type=error]At least one of DESIRED_CPU or MEMORY_SIZE_GB must be specified"
-                exit 1
-              fi
-
-              if [ -n "$VM_UUID" ]; then
-                VM_RESPONSE=$(curl -s -k -w "\n%{http_code}" \
-                  -X GET \
-                  -H "Content-Type: application/json" \
-                  -u "${NUTANIX_USERNAME}:${NUTANIX_PASSWORD}" \
-                  "${API_URL}/vms/${VM_UUID}")
-              else
-                VM_LIST_RESPONSE=$(curl -s -k -w "\n%{http_code}" \
-                  -X POST \
-                  -H "Content-Type: application/json" \
-                  -u "${NUTANIX_USERNAME}:${NUTANIX_PASSWORD}" \
-                  -d "{\"kind\": \"vm\", \"filter\": \"vm_name==${VM_NAME}\"}" \
-                  "${API_URL}/vms/list")
-
-                HTTP_CODE=$(echo "$VM_LIST_RESPONSE" | tail -n1)
-                RESPONSE_BODY=$(echo "$VM_LIST_RESPONSE" | sed '$d')
-
-                if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
-                  ENTITY=$(echo "$RESPONSE_BODY" | jq '.entities[0]')
-                  if [ "$ENTITY" = "null" ] || [ -z "$ENTITY" ]; then
-                    echo "##vso[task.logissue type=error]VM not found: $VM_NAME"
-                    exit 1
-                  fi
-                  VM_RESPONSE=$(printf "%s\n%s" "$ENTITY" "$HTTP_CODE")
-                else
-                  echo "##vso[task.logissue type=error]Failed to search VM by name (HTTP $HTTP_CODE)"
-                  echo "$RESPONSE_BODY" | jq '.' 2>/dev/null || echo "$RESPONSE_BODY"
-                  exit 1
-                fi
-              fi
-
-              HTTP_CODE=$(echo "$VM_RESPONSE" | tail -n1)
-              VM_DATA=$(echo "$VM_RESPONSE" | sed '$d')
-
-              if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
-                echo "##vso[task.logissue type=error]Failed to fetch VM details for validation (HTTP $HTTP_CODE)"
-                echo "$VM_DATA" | jq '.' 2>/dev/null || echo "$VM_DATA"
-                exit 1
-              fi
-
-              CURRENT_VCPUS=$(echo "$VM_DATA" | jq -r '.spec.resources.num_vcpus_per_socket')
-              CURRENT_SOCKETS=$(echo "$VM_DATA" | jq -r '.spec.resources.num_sockets')
-              CURRENT_TOTAL_CPU=$((CURRENT_VCPUS * CURRENT_SOCKETS))
-              CURRENT_MEMORY_GB=$(($(echo "$VM_DATA" | jq -r '.spec.resources.memory_size_mib') / 1024))
-
-              TARGET_CPU=${DESIRED_CPU:-$CURRENT_TOTAL_CPU}
-              TARGET_MEMORY_GB=${MEMORY_GB:-$CURRENT_MEMORY_GB}
-
-              echo "Current:   CPU=$CURRENT_TOTAL_CPU, Memory=${CURRENT_MEMORY_GB}GB"
-              echo "Requested: CPU=$TARGET_CPU, Memory=${TARGET_MEMORY_GB}GB"
-
-              if [ "$TARGET_CPU" -eq "$CURRENT_TOTAL_CPU" ] && [ "$TARGET_MEMORY_GB" -eq "$CURRENT_MEMORY_GB" ]; then
-                echo "##vso[task.setvariable variable=spec_is_different;isOutput=true]false"
-                echo "ℹ️  No resize needed. Requested CPU and memory already match current VM spec."
-                exit 0
-              fi
-
-              echo "##vso[task.setvariable variable=spec_is_different;isOutput=true]true"
-              echo "✅ Validation passed: requested spec differs from current VM spec"
-            name: validateSpec
-            displayName: 'Validate requested spec differs from current'
-            env:
-              NUTANIX_ENDPOINT: $(NUTANIX_ENDPOINT)
-              NUTANIX_USERNAME: $(NUTANIX_USERNAME)
-              NUTANIX_PASSWORD: $(NUTANIX_PASSWORD)
-
-
-      # ----------------------------------------------------------------------------------------------
-      # 3) Resize the VM 
-      # ----------------------------------------------------------------------------------------------
-      - job: ResizeVM
-        displayName: 'Resize VM'
         dependsOn:
-          - ValidateSpec
+          - ValidateInputParameters
           - ${{ if eq(parameters.use_cyberArk, true) }}:
               - CyberArkAuth
-        condition: and(succeeded(), eq(dependencies.ValidateSpec.outputs['validateSpec.spec_is_different'], 'true'))
         variables:
           ${{ if eq(parameters.use_cyberArk, true) }}:
             NUTANIX_USERNAME: $[ dependencies.CyberArkAuth.outputs['retrieveCredentials.NUTANIX_USERNAME'] ]
@@ -281,31 +159,6 @@ stages:
             NUTANIX_PASSWORD: $(PRISM_PASSWORD)
             NUTANIX_ENDPOINT: $(PRISM_ELEMENT_FQDN)
         steps:
-          - checkout: self
-            clean: true
-
-          - bash: |
-              VM_NAME="${{ parameters.VM_NAME }}"
-              VM_UUID="${{ parameters.VM_UUID }}"
-              STOP_VM="${{ lower(parameters.STOP_VM) }}"
-              DESIRED_CPU="${{ parameters.DESIRED_CPU }}"
-              MEMORY_GB="${{ parameters.MEMORY_SIZE_GB }}"
-
-              if [ -z "$VM_NAME" ] && [ -z "$VM_UUID" ]; then
-                echo "##vso[task.logissue type=error]Either VM_NAME or VM_UUID is required"
-                exit 1
-              fi
-
-              if [ -z "$DESIRED_CPU" ] && [ -z "$MEMORY_GB" ]; then
-                echo "##vso[task.logissue type=error]At least one of DESIRED_CPU or MEMORY_SIZE_GB must be specified"
-                exit 1
-              fi
-
-              echo "VM Identifier: ${VM_NAME}${VM_UUID:+ (UUID: $VM_UUID)}"
-              [ -n "$DESIRED_CPU" ] && echo "Desired Total vCPUs: $DESIRED_CPU"
-              [ -n "$MEMORY_GB" ] && echo "New Memory: $MEMORY_GB GB"
-              echo "Stop VM Before Resize: $STOP_VM"
-            displayName: 'Validate inputs'
 
           - bash: |
               set -e
@@ -352,6 +205,11 @@ stages:
               echo "  Getting VM Details"
               echo "========================================="
 
+              if [ -z "$VM_NAME" ] && [ -z "$VM_UUID" ]; then
+                echo "##vso[task.logissue type=error]Either VM_NAME or VM_UUID is required"
+                exit 1
+              fi
+
               if [ -n "$VM_UUID" ]; then
                 echo ">>> Searching by UUID: $VM_UUID"
                 VM_RESPONSE=$(curl -s -k -w "\n%{http_code}" \
@@ -359,7 +217,7 @@ stages:
                   -H "Content-Type: application/json" \
                   -u "${NUTANIX_USERNAME}:${NUTANIX_PASSWORD}" \
                   "${API_URL}/vms/${VM_UUID}")
-              elif [ -n "$VM_NAME" ]; then
+              else
                 echo ">>> Searching by name: $VM_NAME"
                 VM_LIST_RESPONSE=$(curl -s -k -w "\n%{http_code}" \
                   -X POST \
@@ -372,53 +230,51 @@ stages:
                 RESPONSE_BODY=$(echo "$VM_LIST_RESPONSE" | sed '$d')
 
                 if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
-                  ENTITIES=$(echo "$RESPONSE_BODY" | jq '.entities[0]' 2>/dev/null)
-                  if [ "$ENTITIES" = "null" ] || [ -z "$ENTITIES" ]; then
+                  ENTITY=$(echo "$RESPONSE_BODY" | jq '.entities[0]')
+                  if [ "$ENTITY" = "null" ] || [ -z "$ENTITY" ]; then
                     echo "##vso[task.logissue type=error]VM not found: $VM_NAME"
                     exit 1
                   fi
-                  VM_RESPONSE=$(printf "%s\n%s" "$ENTITIES" "$HTTP_CODE")
+                  VM_RESPONSE=$(printf "%s\n%s" "$ENTITY" "$HTTP_CODE")
                 else
-                  echo "##vso[task.logissue type=error]Failed to search for VM"
+                  echo "##vso[task.logissue type=error]Failed to search VM by name (HTTP $HTTP_CODE)"
+                  echo "$RESPONSE_BODY" | jq '.' 2>/dev/null || echo "$RESPONSE_BODY"
                   exit 1
                 fi
-              else
-                echo "##vso[task.logissue type=error]No VM identifier provided"
-                exit 1
               fi
 
               HTTP_CODE=$(echo "$VM_RESPONSE" | tail -n1)
               VM_DATA=$(echo "$VM_RESPONSE" | sed '$d')
 
-              if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
-                VM_UUID=$(echo "$VM_DATA" | jq -r '.metadata.uuid')
-                VM_NAME=$(echo "$VM_DATA" | jq -r '.spec.name')
-                CURRENT_VCPUS=$(echo "$VM_DATA" | jq -r '.spec.resources.num_vcpus_per_socket')
-                CURRENT_SOCKETS=$(echo "$VM_DATA" | jq -r '.spec.resources.num_sockets')
-                CURRENT_MEMORY_MIB=$(echo "$VM_DATA" | jq -r '.spec.resources.memory_size_mib')
-                CURRENT_MEMORY_GB=$((CURRENT_MEMORY_MIB / 1024))
-                POWER_STATE=$(echo "$VM_DATA" | jq -r '.spec.resources.power_state')
-
-                echo "✅ VM Found!"
-                echo "  Name: $VM_NAME"
-                echo "  UUID: $VM_UUID"
-                echo "  Current vCPUs/socket: $CURRENT_VCPUS"
-                echo "  Current Sockets: $CURRENT_SOCKETS"
-                echo "  Current Memory: ${CURRENT_MEMORY_GB}GB"
-                echo "  Power State: $POWER_STATE"
-
-                # Persist outputs for downstream steps
-                echo "##vso[task.setvariable variable=vm_uuid;isOutput=true]$VM_UUID"
-                echo "##vso[task.setvariable variable=vm_name;isOutput=true]$VM_NAME"
-                echo "##vso[task.setvariable variable=current_vcpus;isOutput=true]$CURRENT_VCPUS"
-                echo "##vso[task.setvariable variable=current_sockets;isOutput=true]$CURRENT_SOCKETS"
-                echo "##vso[task.setvariable variable=current_memory_gb;isOutput=true]$CURRENT_MEMORY_GB"
-                echo "##vso[task.setvariable variable=power_state;isOutput=true]$POWER_STATE"
-              else
-                echo "##vso[task.logissue type=error]Failed to get VM details (HTTP $HTTP_CODE)"
-                echo "$VM_DATA"
+              if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+                echo "##vso[task.logissue type=error]Failed to fetch VM details (HTTP $HTTP_CODE)"
+                echo "$VM_DATA" | jq '.' 2>/dev/null || echo "$VM_DATA"
                 exit 1
               fi
+
+              VM_UUID=$(echo "$VM_DATA" | jq -r '.metadata.uuid')
+              VM_NAME=$(echo "$VM_DATA" | jq -r '.spec.name')
+              CURRENT_VCPUS=$(echo "$VM_DATA" | jq -r '.spec.resources.num_vcpus_per_socket')
+              CURRENT_SOCKETS=$(echo "$VM_DATA" | jq -r '.spec.resources.num_sockets')
+              CURRENT_MEMORY_MIB=$(echo "$VM_DATA" | jq -r '.spec.resources.memory_size_mib')
+              CURRENT_MEMORY_GB=$((CURRENT_MEMORY_MIB / 1024))
+              POWER_STATE=$(echo "$VM_DATA" | jq -r '.spec.resources.power_state')
+
+              echo "✅ VM Found!"
+              echo "  Name: $VM_NAME"
+              echo "  UUID: $VM_UUID"
+              echo "  Current vCPUs/socket: $CURRENT_VCPUS"
+              echo "  Current Sockets: $CURRENT_SOCKETS"
+              echo "  Current Memory: ${CURRENT_MEMORY_GB}GB"
+              echo "  Power State: $POWER_STATE"
+
+              # Persist outputs for downstream steps and the ResizeVM job
+              echo "##vso[task.setvariable variable=vm_uuid;isOutput=true]$VM_UUID"
+              echo "##vso[task.setvariable variable=vm_name;isOutput=true]$VM_NAME"
+              echo "##vso[task.setvariable variable=current_vcpus;isOutput=true]$CURRENT_VCPUS"
+              echo "##vso[task.setvariable variable=current_sockets;isOutput=true]$CURRENT_SOCKETS"
+              echo "##vso[task.setvariable variable=current_memory_gb;isOutput=true]$CURRENT_MEMORY_GB"
+              echo "##vso[task.setvariable variable=power_state;isOutput=true]$POWER_STATE"
             name: getVm
             displayName: 'Get VM details'
             env:
@@ -429,8 +285,91 @@ stages:
           - bash: |
               set -e
 
-              VM_UUID="$(getVm.vm_uuid)"
-              POWER_STATE="$(getVm.power_state)"
+              DESIRED_CPU="${{ parameters.DESIRED_CPU }}"
+              MEMORY_GB="${{ parameters.MEMORY_SIZE_GB }}"
+
+              # Reuse the VM details already fetched by the getVm step (no extra API call).
+              CURRENT_VCPUS="$(getVm.current_vcpus)"
+              CURRENT_SOCKETS="$(getVm.current_sockets)"
+              CURRENT_MEMORY_GB="$(getVm.current_memory_gb)"
+              CURRENT_TOTAL_CPU=$((CURRENT_VCPUS * CURRENT_SOCKETS))
+
+              echo "Current spec: CPU=$CURRENT_TOTAL_CPU, Memory=${CURRENT_MEMORY_GB}GB"
+
+              # Compare only the parameters that were actually provided.
+              CPU_DIFFERS=false
+              MEMORY_DIFFERS=false
+
+              if [ -n "$DESIRED_CPU" ]; then
+                echo "Requested CPU: $DESIRED_CPU (current: $CURRENT_TOTAL_CPU)"
+                if [ "$DESIRED_CPU" -ne "$CURRENT_TOTAL_CPU" ]; then
+                  CPU_DIFFERS=true
+                fi
+              else
+                echo "CPU not requested → skipping CPU comparison"
+              fi
+
+              if [ -n "$MEMORY_GB" ]; then
+                echo "Requested Memory: ${MEMORY_GB}GB (current: ${CURRENT_MEMORY_GB}GB)"
+                if [ "$MEMORY_GB" -ne "$CURRENT_MEMORY_GB" ]; then
+                  MEMORY_DIFFERS=true
+                fi
+              else
+                echo "Memory not requested → skipping memory comparison"
+              fi
+
+              if [ "$CPU_DIFFERS" = "false" ] && [ "$MEMORY_DIFFERS" = "false" ]; then
+                echo "##vso[task.setvariable variable=spec_is_different;isOutput=true]false"
+                echo "ℹ️  No resize needed. Provided value(s) already match the current VM spec."
+                exit 0
+              fi
+
+              echo "##vso[task.setvariable variable=spec_is_different;isOutput=true]true"
+              echo "✅ Validation passed: at least one provided value differs from current VM spec"
+            name: validateSpec
+            displayName: 'Validate requested spec differs from current'
+
+
+      # ----------------------------------------------------------------------------------------------
+      # 3) Resize the VM 
+      # ----------------------------------------------------------------------------------------------
+      - job: ResizeVM
+        displayName: 'Resize VM'
+        dependsOn:
+          - ValidateSpec
+          - ${{ if eq(parameters.use_cyberArk, true) }}:
+              - CyberArkAuth
+        condition: and(succeeded(), eq(dependencies.ValidateSpec.outputs['validateSpec.spec_is_different'], 'true'))
+        variables:
+          ${{ if eq(parameters.use_cyberArk, true) }}:
+            NUTANIX_USERNAME: $[ dependencies.CyberArkAuth.outputs['retrieveCredentials.NUTANIX_USERNAME'] ]
+            NUTANIX_PASSWORD: $[ dependencies.CyberArkAuth.outputs['retrieveCredentials.NUTANIX_PASSWORD'] ]
+            NUTANIX_ENDPOINT: $[ dependencies.CyberArkAuth.outputs['retrieveCredentials.NUTANIX_ENDPOINT'] ]
+            vm_uuid: $[ dependencies.ValidateSpec.outputs['getVm.vm_uuid'] ]
+            vm_name: $[ dependencies.ValidateSpec.outputs['getVm.vm_name'] ]
+            power_state: $[ dependencies.ValidateSpec.outputs['getVm.power_state'] ]
+            current_vcpus: $[ dependencies.ValidateSpec.outputs['getVm.current_vcpus'] ]
+            current_sockets: $[ dependencies.ValidateSpec.outputs['getVm.current_sockets'] ]
+            current_memory_gb: $[ dependencies.ValidateSpec.outputs['getVm.current_memory_gb'] ]
+          ${{ else }}:
+            NUTANIX_USERNAME: $(PRISM_USERNAME)
+            NUTANIX_PASSWORD: $(PRISM_PASSWORD)
+            NUTANIX_ENDPOINT: $(PRISM_ELEMENT_FQDN)
+            vm_uuid: $[ dependencies.ValidateSpec.outputs['getVm.vm_uuid'] ]
+            vm_name: $[ dependencies.ValidateSpec.outputs['getVm.vm_name'] ]
+            power_state: $[ dependencies.ValidateSpec.outputs['getVm.power_state'] ]
+            current_vcpus: $[ dependencies.ValidateSpec.outputs['getVm.current_vcpus'] ]
+            current_sockets: $[ dependencies.ValidateSpec.outputs['getVm.current_sockets'] ]
+            current_memory_gb: $[ dependencies.ValidateSpec.outputs['getVm.current_memory_gb'] ]
+        steps:
+          - checkout: self
+            clean: true
+
+          - bash: |
+              set -e
+
+              VM_UUID="$(vm_uuid)"
+              POWER_STATE="$(power_state)"
               STOP_VM="${{ lower(parameters.STOP_VM) }}"
               API_URL="https://${NUTANIX_ENDPOINT}:9440/api/nutanix/v3"
 
@@ -552,8 +491,8 @@ stages:
           - bash: |
               set -e
 
-              VM_UUID="$(getVm.vm_uuid)"
-              VM_NAME="$(getVm.vm_name)"
+              VM_UUID="$(vm_uuid)"
+              VM_NAME="$(vm_name)"
               API_URL="https://${NUTANIX_ENDPOINT}:9440/api/nutanix/v3/vms/${VM_UUID}"
 
               # Refresh VM data right before resize to avoid entity version conflicts
@@ -693,7 +632,7 @@ stages:
           - bash: |
               set -e
 
-              VM_UUID="$(getVm.vm_uuid)"
+              VM_UUID="$(vm_uuid)"
               API_URL="https://${NUTANIX_ENDPOINT}:9440/api/nutanix/v3"
 
               echo ">>> Starting VM (it was initially ON before resize)..."
@@ -792,7 +731,7 @@ stages:
               NUTANIX_PASSWORD: $(NUTANIX_PASSWORD)
 
           - bash: |
-              VM_UUID="$(getVm.vm_uuid)"
+              VM_UUID="$(vm_uuid)"
               API_URL="https://${NUTANIX_ENDPOINT}:9440/api/nutanix/v3/vms/${VM_UUID}"
 
               echo ">>> Fetching updated VM configuration..."
@@ -826,7 +765,7 @@ stages:
               SUMMARY_FILE="$(Build.ArtifactStagingDirectory)/vm-resize-summary.md"
               mkdir -p "$(Build.ArtifactStagingDirectory)"
 
-              CURRENT_TOTAL=$(( $(getVm.current_vcpus) * $(getVm.current_sockets) ))
+              CURRENT_TOTAL=$(( $(current_vcpus) * $(current_sockets) ))
               STATUS_LINE="❌ Resize Failed"
               if [ "$(resize.success)" = "true" ]; then
                 STATUS_LINE="✅ Resize Successful"
@@ -837,13 +776,13 @@ stages:
 
               | Property         | Before                              | After                                 |
               |------------------|-------------------------------------|---------------------------------------|
-              | VM Name          | $(getVm.vm_name)                    | $(getVm.vm_name)                      |
-              | VM UUID          | $(getVm.vm_uuid)                    | $(getVm.vm_uuid)                      |
+              | VM Name          | $(vm_name)                          | $(vm_name)                            |
+              | VM UUID          | $(vm_uuid)                          | $(vm_uuid)                            |
               | Total vCPUs      | $CURRENT_TOTAL                      | $(resize.new_total_vcpus)             |
-              | Sockets          | $(getVm.current_sockets)            | $(resize.new_sockets)                 |
-              | vCPUs per Socket | $(getVm.current_vcpus)              | $(resize.new_vcpus_per_socket)        |
-              | Memory           | $(getVm.current_memory_gb)GB        | -                                     |
-              | Power State      | $(getVm.power_state)                | -                                     |
+              | Sockets          | $(current_sockets)                  | $(resize.new_sockets)                 |
+              | vCPUs per Socket | $(current_vcpus)                    | $(resize.new_vcpus_per_socket)        |
+              | Memory           | $(current_memory_gb)GB              | -                                     |
+              | Power State      | $(power_state)                      | -                                     |
               | Task UUID        | -                                   | $(resize.task_uuid)                   |
 
               ### Status
