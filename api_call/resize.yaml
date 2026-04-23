@@ -22,7 +22,7 @@ parameters:
     type: string
     default: ''
 
-  - name: DESIRED_CPU
+  - name: CPU_NUM
     displayName: 'Desired total number of vCPUs'
     type: string
     default: ''
@@ -57,7 +57,7 @@ trigger: none
 
 pool: self-hosted-ubuntu
 
-name: 'VM Resize | ${{ coalesce(parameters.VM_NAME, parameters.VM_UUID) }} | CPU:${{ parameters.DESIRED_CPU }} RAM:${{ parameters.MEMORY_SIZE_GB }}GB'
+name: 'VM Resize | ${{ coalesce(parameters.VM_NAME, parameters.VM_UUID) }} | CPU:${{ parameters.CPU_NUM }} RAM:${{ parameters.MEMORY_SIZE_GB }}GB'
 
 # Credentials and CyberArk configuration are pulled from this variable group:
 #   - When use_cyberArk = false: PRISM_USERNAME, PRISM_PASSWORD, PRISM_ELEMENT_FQDN
@@ -78,7 +78,7 @@ stages:
     jobs:
 
       # ----------------------------------------------------------------------------------------------
-      # 1) Validate input parameters (DESIRED_CPU / MEMORY_SIZE_GB)
+      # 1) Validate input parameters (CPU_NUM / MEMORY_SIZE_GB)
       # ----------------------------------------------------------------------------------------------
       - job: ValidateInputParameters
         displayName: 'Validate Input Parameters'
@@ -86,15 +86,15 @@ stages:
           - bash: |
               set -e
 
-              DESIRED_CPU="${{ parameters.DESIRED_CPU }}"
+              CPU_NUM="${{ parameters.CPU_NUM }}"
               MEMORY_GB="${{ parameters.MEMORY_SIZE_GB }}"
 
-              echo "Provided DESIRED_CPU:    '${DESIRED_CPU}'"
+              echo "Provided CPU_NUM:    '${CPU_NUM}'"
               echo "Provided MEMORY_SIZE_GB: '${MEMORY_GB}'"
 
               # At least one of the two must be provided
-              if [ -z "$DESIRED_CPU" ] && [ -z "$MEMORY_GB" ]; then
-                echo "##vso[task.logissue type=error]At least one of DESIRED_CPU or MEMORY_SIZE_GB must be specified"
+              if [ -z "$CPU_NUM" ] && [ -z "$MEMORY_GB" ]; then
+                echo "##vso[task.logissue type=error]At least one of CPU_NUM or MEMORY_SIZE_GB must be specified"
                 exit 1
               fi
 
@@ -107,12 +107,12 @@ stages:
                 esac
               }
 
-              if [ -n "$DESIRED_CPU" ]; then
-                if ! is_positive_integer "$DESIRED_CPU"; then
-                  echo "##vso[task.logissue type=error]DESIRED_CPU must be a positive integer (got: '$DESIRED_CPU')"
+              if [ -n "$CPU_NUM" ]; then
+                if ! is_positive_integer "$CPU_NUM"; then
+                  echo "##vso[task.logissue type=error]CPU_NUM must be a positive integer (got: '$CPU_NUM')"
                   exit 1
                 fi
-                echo "✅ DESIRED_CPU is valid: $DESIRED_CPU"
+                echo "✅ CPU_NUM is valid: $CPU_NUM"
               fi
 
               if [ -n "$MEMORY_GB" ]; then
@@ -124,7 +124,7 @@ stages:
               fi
 
               echo "✅ Input parameter validation passed"
-            displayName: 'Validate DESIRED_CPU and MEMORY_SIZE_GB'
+            displayName: 'Validate CPU_NUM and MEMORY_SIZE_GB'
 
       # ----------------------------------------------------------------------------------------------
       # 2) (Optional until CyberArk integration is complete) Fetch Nutanix credentials from CyberArk
@@ -132,6 +132,7 @@ stages:
       - ${{ if eq(parameters.use_cyberArk, true) }}:
           - template: ../Templates/cyberarkAuth.yaml
             parameters:
+              dependsOn: ValidateInputParameters
               cyberark_ccp_url: $(CYBERARK_CCP_URL)
               cyberark_app_id: $(CYBERARK_APP_ID)
               cyberark_safe: $(CYBERARK_SAFE)
@@ -285,7 +286,7 @@ stages:
           - bash: |
               set -e
 
-              DESIRED_CPU="${{ parameters.DESIRED_CPU }}"
+              CPU_NUM="${{ parameters.CPU_NUM }}"
               MEMORY_GB="${{ parameters.MEMORY_SIZE_GB }}"
 
               # Reuse the VM details already fetched by the getVm step (no extra API call).
@@ -300,9 +301,9 @@ stages:
               CPU_DIFFERS=false
               MEMORY_DIFFERS=false
 
-              if [ -n "$DESIRED_CPU" ]; then
-                echo "Requested CPU: $DESIRED_CPU (current: $CURRENT_TOTAL_CPU)"
-                if [ "$DESIRED_CPU" -ne "$CURRENT_TOTAL_CPU" ]; then
+              if [ -n "$CPU_NUM" ]; then
+                echo "Requested CPU: $CPU_NUM (current: $CURRENT_TOTAL_CPU)"
+                if [ "$CPU_NUM" -ne "$CURRENT_TOTAL_CPU" ]; then
                   CPU_DIFFERS=true
                 fi
               else
@@ -516,17 +517,17 @@ stages:
               CURRENT_MEMORY_GB=$((CURRENT_MEMORY_MIB / 1024))
               CURRENT_TOTAL_CPU=$((CURRENT_VCPUS * CURRENT_SOCKETS))
 
-              DESIRED_CPU="${{ parameters.DESIRED_CPU }}"
+              CPU_NUM="${{ parameters.CPU_NUM }}"
               MEMORY_GB="${{ parameters.MEMORY_SIZE_GB }}"
 
               # num_vcpus_per_socket is fixed at 2 (matches GH workflow logic)
-              if [ -n "$DESIRED_CPU" ]; then
+              if [ -n "$CPU_NUM" ]; then
                 NEW_VCPUS_PER_SOCKET=2
-                NEW_SOCKETS=$((DESIRED_CPU / NEW_VCPUS_PER_SOCKET))
+                NEW_SOCKETS=$((CPU_NUM / NEW_VCPUS_PER_SOCKET))
               else
                 NEW_VCPUS_PER_SOCKET=$CURRENT_VCPUS
                 NEW_SOCKETS=$CURRENT_SOCKETS
-                DESIRED_CPU=$((NEW_VCPUS_PER_SOCKET * NEW_SOCKETS))
+                CPU_NUM=$((NEW_VCPUS_PER_SOCKET * NEW_SOCKETS))
               fi
 
               NEW_MEMORY_MIB=$((${MEMORY_GB:-$CURRENT_MEMORY_GB} * 1024))
@@ -535,7 +536,7 @@ stages:
               echo "  Resizing VM: $VM_NAME"
               echo "========================================="
               echo "CPU Configuration (num_vcpus_per_socket=2):"
-              echo "  Total vCPUs: $CURRENT_TOTAL_CPU → $DESIRED_CPU"
+              echo "  Total vCPUs: $CURRENT_TOTAL_CPU → $CPU_NUM"
               echo "    (Sockets: $CURRENT_SOCKETS → $NEW_SOCKETS, vCPUs/socket: 2)"
               echo "Memory: ${CURRENT_MEMORY_GB}GB → $((NEW_MEMORY_MIB / 1024))GB"
 
@@ -564,7 +565,7 @@ stages:
 
                 echo "##vso[task.setvariable variable=task_uuid;isOutput=true]$TASK_UUID"
                 echo "##vso[task.setvariable variable=success;isOutput=true]true"
-                echo "##vso[task.setvariable variable=new_total_vcpus;isOutput=true]$DESIRED_CPU"
+                echo "##vso[task.setvariable variable=new_total_vcpus;isOutput=true]$CPU_NUM"
                 echo "##vso[task.setvariable variable=new_sockets;isOutput=true]$NEW_SOCKETS"
                 echo "##vso[task.setvariable variable=new_vcpus_per_socket;isOutput=true]$NEW_VCPUS_PER_SOCKET"
               else
