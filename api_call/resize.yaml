@@ -766,29 +766,59 @@ stages:
               SUMMARY_FILE="$(Build.ArtifactStagingDirectory)/vm-resize-summary.md"
               mkdir -p "$(Build.ArtifactStagingDirectory)"
 
-              CURRENT_TOTAL=$(( $(current_vcpus) * $(current_sockets) ))
+              VM_NAME="$(vm_name)"
+              VM_UUID="$(vm_uuid)"
+              POWER_STATE="$(power_state)"
+              CUR_VCPUS="$(current_vcpus)"
+              CUR_SOCKETS="$(current_sockets)"
+              CUR_MEM="$(current_memory_gb)"
+              CURRENT_TOTAL=$(( CUR_VCPUS * CUR_SOCKETS ))
+              NEW_TOTAL="$(resize.new_total_vcpus)"
+              NEW_SOCKETS="$(resize.new_sockets)"
+              NEW_VCPUS="$(resize.new_vcpus_per_socket)"
+              TASK_UUID="$(resize.task_uuid)"
+
               STATUS_LINE="❌ Resize Failed"
               if [ "$(resize.success)" = "true" ]; then
                 STATUS_LINE="✅ Resize Successful"
               fi
 
-              cat > "$SUMMARY_FILE" << EOF
-              ## VM Resize Summary
+              # Compute column widths dynamically so the table always lines up.
+              PROP_W=16
+              BEFORE_W=0
+              AFTER_W=0
+              for v in "$VM_NAME" "$VM_UUID" "$CURRENT_TOTAL" "$CUR_SOCKETS" "$CUR_VCPUS" "${CUR_MEM}GB" "$POWER_STATE" "-"; do
+                [ ${#v} -gt $BEFORE_W ] && BEFORE_W=${#v}
+              done
+              for v in "$VM_NAME" "$VM_UUID" "$NEW_TOTAL" "$NEW_SOCKETS" "$NEW_VCPUS" "-" "$TASK_UUID"; do
+                [ ${#v} -gt $AFTER_W ] && AFTER_W=${#v}
+              done
+              # Ensure widths are at least as wide as the header text
+              [ $BEFORE_W -lt 6 ] && BEFORE_W=6
+              [ $AFTER_W  -lt 5 ] && AFTER_W=5
 
-              | Property         | Before                              | After                                 |
-              |------------------|-------------------------------------|---------------------------------------|
-              | VM Name          | $(vm_name)                          | $(vm_name)                            |
-              | VM UUID          | $(vm_uuid)                          | $(vm_uuid)                            |
-              | Total vCPUs      | $CURRENT_TOTAL                      | $(resize.new_total_vcpus)             |
-              | Sockets          | $(current_sockets)                  | $(resize.new_sockets)                 |
-              | vCPUs per Socket | $(current_vcpus)                    | $(resize.new_vcpus_per_socket)        |
-              | Memory           | $(current_memory_gb)GB              | -                                     |
-              | Power State      | $(power_state)                      | -                                     |
-              | Task UUID        | -                                   | $(resize.task_uuid)                   |
+              ROW_FMT="| %-${PROP_W}s | %-${BEFORE_W}s | %-${AFTER_W}s |\n"
+              SEP_PROP=$(printf '%*s' $PROP_W   '' | tr ' ' '-')
+              SEP_BEF=$(printf  '%*s' $BEFORE_W '' | tr ' ' '-')
+              SEP_AFT=$(printf  '%*s' $AFTER_W  '' | tr ' ' '-')
 
-              ### Status
-              $STATUS_LINE
-              EOF
+              {
+                echo "## VM Resize Summary"
+                echo
+                printf "$ROW_FMT" "Property" "Before" "After"
+                printf "|-%s-|-%s-|-%s-|\n" "$SEP_PROP" "$SEP_BEF" "$SEP_AFT"
+                printf "$ROW_FMT" "VM Name"          "$VM_NAME"       "$VM_NAME"
+                printf "$ROW_FMT" "VM UUID"          "$VM_UUID"       "$VM_UUID"
+                printf "$ROW_FMT" "Total vCPUs"      "$CURRENT_TOTAL" "$NEW_TOTAL"
+                printf "$ROW_FMT" "Sockets"          "$CUR_SOCKETS"   "$NEW_SOCKETS"
+                printf "$ROW_FMT" "vCPUs per Socket" "$CUR_VCPUS"     "$NEW_VCPUS"
+                printf "$ROW_FMT" "Memory"           "${CUR_MEM}GB"   "-"
+                printf "$ROW_FMT" "Power State"      "$POWER_STATE"   "-"
+                printf "$ROW_FMT" "Task UUID"        "-"              "$TASK_UUID"
+                echo
+                echo "### Status"
+                echo "$STATUS_LINE"
+              } > "$SUMMARY_FILE"
 
               echo "Summary written to $SUMMARY_FILE"
               cat "$SUMMARY_FILE"
