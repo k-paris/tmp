@@ -3,14 +3,10 @@
 # Resizes a Nutanix VM (CPU and/or memory) via direct Prism v3 API calls.
 # Credentials are retrieved from CyberArk through the existing
 # Templates/cyberarkAuth.yaml job (which exports NUTANIX_USERNAME,
-# NUTANIX_PASSWORD and NUTANIX_ENDPOINT as job-output variables).
+# NUTANIX_PASSWORD, as job-output variables).
 # =====================================================================
 
 parameters:
-  - name: LIST_VMS
-    displayName: 'List all VMs first (for reference)'
-    type: boolean
-    default: false
 
   - name: VM_NAME
     displayName: 'VM Name'
@@ -26,12 +22,6 @@ parameters:
     displayName: 'Desired total number of vCPUs'
     type: string
     default: ''
-    values:
-      - ''
-      - '2'
-      - '4'
-      - '8'
-      - '16'
 
   - name: MEMORY_SIZE_GB
     displayName: 'New Memory size in GB'
@@ -41,16 +31,29 @@ parameters:
   - name: STOP_VM
     displayName: 'Stop VM before resize if currently ON'
     type: boolean
-    default: true
+    default: false
 
   - name: use_cyberArk
     displayName: 'Use CyberArk to retrieve Nutanix credentials'
     type: boolean
     default: false
 
+  - name: TEST_ENV
+    type: boolean
+    default: false
+
   - name: TEST_RUN
     type: boolean
     default: true
+
+  - name: USE_SECONDARY_PRISM
+    type: boolean
+    default: false
+
+  - name: ALLOW_PRD_VM_DOWNGRADE
+    displayName: 'Allow downgrading CPU/Memory on PRD VMs (not recommended)'
+    type: boolean
+    default: false
 
 
 trigger: none
@@ -60,7 +63,10 @@ pool: self-hosted-ubuntu
 name: 'VM Resize | ${{ coalesce(parameters.VM_NAME, parameters.VM_UUID) }} | CPU:${{ parameters.CPU_NUM }} RAM:${{ parameters.MEMORY_SIZE_GB }}GB'
 
 # Credentials and CyberArk configuration are pulled from this variable group:
-#   - When use_cyberArk = false: PRISM_USERNAME, PRISM_PASSWORD, PRISM_ELEMENT_FQDN
+#   - When use_cyberArk = false: PRISM_USERNAME, PRISM_PASSWORD,
+#                                PRISM_TST_URL, PRISM_DMZ_URL, PRISM_LAN_URL
+#                                (the endpoint is selected at runtime by the
+#                                SelectPrismURL step based on TEST_ENV/VM_NAME)
 #   - When use_cyberArk = true:  CYBERARK_CCP_URL, CYBERARK_APP_ID, CYBERARK_SAFE,
 #                                CYBERARK_OBJECT, NUTANIX_CLUSTER_URL,
 #                                CYBERARK_CLIENT_CERT_PATH
@@ -94,7 +100,7 @@ stages:
 
               # At least one of the two must be provided
               if [ -z "$CPU_NUM" ] && [ -z "$MEMORY_GB" ]; then
-                echo "##vso[task.logissue type=error]At least one of CPU_NUM or MEMORY_SIZE_GB must be specified"
+                echo "##vso[task.logissue type=error]❌ At least one of CPU_NUM or MEMORY_SIZE_GB must be specified"
                 exit 1
               fi
 
@@ -137,12 +143,12 @@ stages:
               cyberark_app_id: $(CYBERARK_APP_ID)
               cyberark_safe: $(CYBERARK_SAFE)
               cyberark_object: $(CYBERARK_OBJECT)
-              nutanix_cluster_url: $(NUTANIX_CLUSTER_URL)
-              cyberark_client_cert_path: $(CYBERARK_CLIENT_CERT_PATH)
-              TEST_RUN: ${{ parameters.TEST_RUN }}
+              # nutanix_cluster_url: $(NUTANIX_CLUSTER_URL)
+              # cyberark_client_cert_path: $(CYBERARK_CLIENT_CERT_PATH)
+              TEST_ENV: ${{ parameters.TEST_ENV }}
 
       # ----------------------------------------------------------------------------------------------
-      # 2) Validate that the requested spec differs from the current one
+      # 3) Validate that the requested spec 
       # ----------------------------------------------------------------------------------------------
       - job: ValidateSpec
         displayName: 'Validate current spec'
@@ -154,12 +160,66 @@ stages:
           ${{ if eq(parameters.use_cyberArk, true) }}:
             NUTANIX_USERNAME: $[ dependencies.CyberArkAuth.outputs['retrieveCredentials.NUTANIX_USERNAME'] ]
             NUTANIX_PASSWORD: $[ dependencies.CyberArkAuth.outputs['retrieveCredentials.NUTANIX_PASSWORD'] ]
-            NUTANIX_ENDPOINT: $[ dependencies.CyberArkAuth.outputs['retrieveCredentials.NUTANIX_ENDPOINT'] ]
           ${{ else }}:
             NUTANIX_USERNAME: $(PRISM_USERNAME)
             NUTANIX_PASSWORD: $(PRISM_PASSWORD)
-            NUTANIX_ENDPOINT: $(PRISM_ELEMENT_FQDN)
+            # NUTANIX_ENDPOINT is set dynamically by the SelectPrismURL step below.
         steps:
+          
+          - bash: |
+              set -e
+
+              TEST_ENV="${{ lower(parameters.TEST_ENV) }}"
+              VM_NAME="${{ parameters.VM_NAME }}"
+              VM_UUID="${{ parameters.VM_UUID }}"
+              PRISM_URL=""
+
+              echo "========================================"
+              echo "  Selecting Prism Endpoint"
+              echo "========================================"
+              echo "  TEST_ENV: $TEST_ENV"
+              echo "  VM_NAME:  $VM_NAME"
+              echo "  VM_UUID:  $VM_UUID"
+
+              if [ "$TEST_ENV" = "True" ]; then
+                PRISM_URL="$(PRISM_TST_URL)"
+                echo "ℹ️ TEST_ENV=true → using test cluster: $PRISM_URL"
+              else
+                if [ -z "$VM_NAME" ]; then
+                  echo "##vso[task.logissue type=error]❌ VM_NAME is required to select the Prism endpoint when TEST_ENV=false (cluster zone is encoded in the VM name)."
+                  exit 1
+                fi
+
+                # Naming convention: X[W|L][10|16][D|L]...
+                if ! echo "$VM_NAME" | grep -Eq '^X[WL](10|16)[DL].*'; then
+                  echo "##vso[task.logissue type=error]❌ VM_NAME '$VM_NAME' does not match expected naming convention X[W|L][10|16][D|L]..."
+                  exit 1
+                fi
+
+                ZONE_CHAR=$(echo "$VM_NAME" | cut -c5)
+                case "$ZONE_CHAR" in
+                  D) PRISM_URL="$(PRISM_DMZ_URL)" ; ZONE="DMZ" ; SECONDARY_URL="$(PRISM_LAN_URL)" ;;
+                  L) PRISM_URL="$(PRISM_LAN_URL)" ; ZONE="LAN" ; SECONDARY_URL="$(PRISM_DMZ_URL)" ;;
+                  *)
+                    echo "##vso[task.logissue type=error]❌ Unrecognized zone character '$ZONE_CHAR' in VM_NAME '$VM_NAME' (expected D or L)."
+                    exit 1
+                    ;;
+                esac
+                echo "ℹ️ Detected zone: $ZONE → using $PRISM_URL"
+              fi
+
+              if [ -z "$PRISM_URL" ]; then
+                echo "##vso[task.logissue type=error]❌ Resolved Prism URL is empty. Verify variable group keys: PRISM_TST_URL / PRISM_DMZ_URL / PRISM_LAN_URL."
+                exit 1
+              fi
+
+              # Output variable for downstream jobs.
+              echo "##vso[task.setvariable variable=PRISM_URL;isOutput=true]$PRISM_URL"
+              echo "##vso[task.setvariable variable=PRISM_SECONDARY_URL;isOutput=true]$SECONDARY_URL"
+              # Override NUTANIX_ENDPOINT for the remaining steps in this job.
+              echo "##vso[task.setvariable variable=NUTANIX_ENDPOINT]$PRISM_URL"
+            name: selectPrism
+            displayName: 'SelectPrismURL'
 
           - bash: |
               set -e
@@ -177,14 +237,14 @@ stages:
               RESPONSE_BODY=$(echo "$AUTH_RESPONSE" | sed '$d')
 
               if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
-                echo "Prism authentication check passed"
+                echo "✅ Prism authentication check passed"
                 exit 0
               fi
 
               if [ "$HTTP_CODE" = "401" ]; then
-                echo "##vso[task.logissue type=error]Prism authentication failed (HTTP 401). Verify NUTANIX_USERNAME and NUTANIX_PASSWORD."
+                echo "##vso[task.logissue type=error]❌ Prism authentication failed (HTTP 401). Verify NUTANIX_USERNAME and NUTANIX_PASSWORD."
               else
-                echo "##vso[task.logissue type=error]Prism preflight check failed (HTTP $HTTP_CODE). Verify endpoint/credentials/network."
+                echo "##vso[task.logissue type=error]❌ Prism preflight check failed (HTTP $HTTP_CODE). Verify endpoint/credentials/network."
               fi
 
               echo "$RESPONSE_BODY" | jq '.' 2>/dev/null || echo "$RESPONSE_BODY"
@@ -218,28 +278,174 @@ stages:
                   -H "Content-Type: application/json" \
                   -u "${NUTANIX_USERNAME}:${NUTANIX_PASSWORD}" \
                   "${API_URL}/vms/${VM_UUID}")
-              else
-                echo ">>> Searching by name: $VM_NAME"
-                VM_LIST_RESPONSE=$(curl -s -k -w "\n%{http_code}" \
-                  -X POST \
-                  -H "Content-Type: application/json" \
-                  -u "${NUTANIX_USERNAME}:${NUTANIX_PASSWORD}" \
-                  -d "{\"kind\": \"vm\", \"filter\": \"vm_name==${VM_NAME}\"}" \
-                  "${API_URL}/vms/list")
 
-                HTTP_CODE=$(echo "$VM_LIST_RESPONSE" | tail -n1)
-                RESPONSE_BODY=$(echo "$VM_LIST_RESPONSE" | sed '$d')
+                # Check if the VM was found or if the API returned an error.
+                HTTP_CODE=$(echo "$VM_RESPONSE" | tail -n1)
+                RESPONSE_BODY=$(echo "$VM_RESPONSE" | sed '$d')
+
+                VM_FOUND=false
 
                 if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
-                  ENTITY=$(echo "$RESPONSE_BODY" | jq '.entities[0]')
-                  if [ "$ENTITY" = "null" ] || [ -z "$ENTITY" ]; then
-                    echo "##vso[task.logissue type=error]VM not found: $VM_NAME"
+                  VM_FOUND=true
+                elif [ "$HTTP_CODE" -ne 404 ]; then
+                  echo "##vso[task.logissue type=warning]⚠️ Failed to fetch VM by UUID '$VM_UUID' on ${NUTANIX_ENDPOINT} (HTTP $HTTP_CODE)"
+                  echo "$RESPONSE_BODY" | jq '.' 2>/dev/null || echo "$RESPONSE_BODY"
+                else
+                  echo "##vso[task.logissue type=warning]⚠️ VM with UUID '$VM_UUID' not found on primary Prism endpoint ${NUTANIX_ENDPOINT} (HTTP 404)."
+                fi
+
+                # If VM is not found and a secondary Prism endpoint is configured, attempt
+                # to find the VM there before failing (Not applicable in test environment).
+
+                if [ "$VM_FOUND" = "false" ] && [ -n "$PRISM_SECONDARY_URL" ] && [ "$TEST_ENV" = "False" ]; then
+                  echo ">>> Retrying lookup on secondary Prism endpoint: $PRISM_SECONDARY_URL"
+                  SECONDARY_API_URL="https://${PRISM_SECONDARY_URL}:9440/api/nutanix/v3"
+                  VM_RESPONSE=$(curl -s -k -w "\n%{http_code}" \
+                    -X GET \
+                    -H "Content-Type: application/json" \
+                    -u "${NUTANIX_USERNAME}:${NUTANIX_PASSWORD}" \
+                    "${SECONDARY_API_URL}/vms/${VM_UUID}")
+
+                  HTTP_CODE=$(echo "$VM_RESPONSE" | tail -n1)
+                  RESPONSE_BODY=$(echo "$VM_RESPONSE" | sed '$d')
+
+                  if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+                    VM_FOUND=true
+                    if [ "$USE_SECONDARY_PRISM" = "True" ]; then
+                      echo "✅ VM found on secondary Prism endpoint. Switching NUTANIX_ENDPOINT to $PRISM_SECONDARY_URL for subsequent steps."
+                      echo "##vso[task.setvariable variable=NUTANIX_ENDPOINT]$PRISM_SECONDARY_URL"
+                    else
+                      echo "##vso[task.logissue type=warning]⚠️ Warning: VM found on secondary Prism endpoint. VM was deployed not in the expected zone based on its name. Consider updating the naming convention or notify Platform Team to redeploy the VM. You can also set USE_SECONDARY_PRISM=true to automatically switch to the secondary endpoint and proceed with the pipeline."
+                      echo "##vso[task.logissue type=error]❌ Exiting the pipeline due to VM being in the wrong zone and USE_SECONDARY_PRISM set to false."
+                      exit 1
+                    fi
+                  else
+                    echo "##vso[task.logissue type=error]❌ VM with UUID '$VM_UUID' not found on secondary Prism endpoint either (HTTP $HTTP_CODE)."
+                    echo "$RESPONSE_BODY" | jq '.' 2>/dev/null || echo "$RESPONSE_BODY"
                     exit 1
                   fi
-                  VM_RESPONSE=$(printf "%s\n%s" "$ENTITY" "$HTTP_CODE")
-                else
-                  echo "##vso[task.logissue type=error]Failed to search VM by name (HTTP $HTTP_CODE)"
-                  echo "$RESPONSE_BODY" | jq '.' 2>/dev/null || echo "$RESPONSE_BODY"
+                fi
+
+                if [ "$VM_FOUND" = "false" ]; then
+                  echo "##vso[task.logissue type=error]❌ VM with UUID '$VM_UUID' not found, exiting the pipeline !!!."
+                  exit 1
+                fi
+
+              else
+                # Helper: query a Prism endpoint by VM_NAME and, on success, populate
+                # VM_RESPONSE / SEARCH_HTTP_CODE / SEARCH_RESPONSE_BODY in the caller's scope.
+                # Returns:
+                #   0 → VM found (VM_RESPONSE populated)
+                #   1 → API/transport error (SEARCH_HTTP_CODE / SEARCH_RESPONSE_BODY populated)
+                #   2 → Eny other case  — caller can print SEARCH_RESPONSE_BODY for debugging and should treat as "not found"
+                #   3 → ambiguous match (>1 VM with that name) — caller must abort
+                search_vm_by_name() {
+                  local _api_url="$1"
+                  local _resp _code _body _match _entity
+
+                  _resp=$(curl -s -k -w "\n%{http_code}" \
+                    -X POST \
+                    -H "Content-Type: application/json" \
+                    -u "${NUTANIX_USERNAME}:${NUTANIX_PASSWORD}" \
+                    -d "{\"kind\": \"vm\", \"filter\": \"vm_name==${VM_NAME}\"}" \
+                    "${_api_url}/vms/list")
+
+                  _code=$(echo "$_resp" | tail -n1)
+                  _body=$(echo "$_resp" | sed '$d')
+
+                  SEARCH_HTTP_CODE="$_code"
+                  SEARCH_RESPONSE_BODY="$_body"
+    
+
+                  # Any non-2xx is an error (including 404, which means the VM with that name doesn't exist in this Prism — we want to distinguish that case from an actual API error, hence the separate return codes).
+                  if [ "$_code" -lt 200 ] || [ "$_code" -ge 300 ]; then
+                    return 1
+                  fi
+
+                  # Even if we got a 2xx, we might have multiple matches (ambiguous name, must abort).
+                  _match=$(echo "$_body" | jq '[.entities[] | select(.spec.name == "'"$VM_NAME"'")] | length')
+
+                  if [ "$_match" -gt 1 ]; then
+                    echo "##vso[task.logissue type=warning]⚠️ Found $_match VMs with name '$VM_NAME' on ${_api_url}. Please specify VM_UUID instead to disambiguate."
+                    echo "$_body" | jq '[.entities[] | select(.spec.name == "'"$VM_NAME"'")] | .[] | {name: .spec.name, uuid: .metadata.uuid}'
+                    return 3
+                  fi
+
+                  if [ "$_match" -eq 1 ]; then
+                    return 0
+                  fi
+
+                  # any other case - print response for debugging and return "not found"
+                  echo "##vso[task.logissue type=warning]⚠️ VM '$VM_NAME' search error on ${_api_url}. VM not found or unexpected response format."
+                  echo "$_body" | jq '.' 2>/dev/null || echo "$_body"
+                  return 2
+                }
+
+                echo ">>> Searching by name: $VM_NAME on primary Prism endpoint ${NUTANIX_ENDPOINT}"
+                VM_FOUND=false
+                set +e
+                search_vm_by_name "$API_URL"
+                SEARCH_RC=$?
+                set -e
+
+                case "$SEARCH_RC" in
+                  0)
+                    VM_FOUND=true
+                    ;;
+                  1)
+                    echo "##vso[task.logissue type=warning]⚠️ Failed to search VM by name on ${NUTANIX_ENDPOINT} (HTTP $SEARCH_HTTP_CODE)"
+                    echo "$SEARCH_RESPONSE_BODY" | jq '.' 2>/dev/null || echo "$SEARCH_RESPONSE_BODY"
+                    ;;
+                  2)
+                    echo "##vso[task.logissue type=warning]⚠️ VM '$VM_NAME' not found on primary Prism endpoint ${NUTANIX_ENDPOINT}."
+                    ;;
+                  3)
+                    # Ambiguous match.
+                    exit 1
+                    ;;
+                esac
+
+                # If VM is not found and a secondary Prism endpoint is configured, attempt to
+                # find the VM there before failing (Not applicable in test environment).
+                if [ "$VM_FOUND" = "false" ] && [ -n "$PRISM_SECONDARY_URL" ] && [ "$TEST_ENV" = "False" ]; then
+                  echo ">>> Retrying lookup on secondary Prism endpoint: $PRISM_SECONDARY_URL"
+                  SECONDARY_API_URL="https://${PRISM_SECONDARY_URL}:9440/api/nutanix/v3"
+
+                  set +e
+                  search_vm_by_name "$SECONDARY_API_URL"
+                  SEARCH_RC=$?
+                  set -e
+
+                  case "$SEARCH_RC" in
+                    0)
+                      VM_FOUND=true
+                      if [ "$USE_SECONDARY_PRISM" = "True" ]; then
+                        echo "✅ VM found on secondary Prism endpoint. Switching NUTANIX_ENDPOINT to $PRISM_SECONDARY_URL for subsequent steps."
+                        echo "##vso[task.setvariable variable=NUTANIX_ENDPOINT]$PRISM_SECONDARY_URL"
+                      else
+                        echo "##vso[task.logissue type=warning]⚠️ Warning: VM found on secondary Prism endpoint. VM was deployed not in the expected zone based on its name. Consider updating the naming convention or notify Platform Team to redeploy the VM. You can also set USE_SECONDARY_PRISM=true to automatically switch to the secondary endpoint and proceed with the pipeline."
+                        echo "##vso[task.logissue type=error]❌ Exiting the pipeline due to VM being in the wrong zone and USE_SECONDARY_PRISM set to false."
+                        exit 1
+                      fi
+                      ;;
+                    1)
+                      echo "##vso[task.logissue type=error]❌ Failed to search VM by name on secondary Prism endpoint ${PRISM_SECONDARY_URL} (HTTP $SEARCH_HTTP_CODE)"
+                      echo "$SEARCH_RESPONSE_BODY" | jq '.' 2>/dev/null || echo "$SEARCH_RESPONSE_BODY"
+                      exit 1
+                      ;;
+                    2)
+                      echo "##vso[task.logissue type=error]❌ VM '$VM_NAME' not found on secondary Prism endpoint either."
+                      exit 1
+                      ;;
+                    3)
+                      # Ambiguous match.
+                      exit 1
+                      ;;
+                  esac
+                fi
+
+                if [ "$VM_FOUND" = "false" ]; then
+                  echo "##vso[task.logissue type=error]❌ VM with name '$VM_NAME' not found, exiting the pipeline !!!."
                   exit 1
                 fi
               fi
@@ -247,11 +453,6 @@ stages:
               HTTP_CODE=$(echo "$VM_RESPONSE" | tail -n1)
               VM_DATA=$(echo "$VM_RESPONSE" | sed '$d')
 
-              if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
-                echo "##vso[task.logissue type=error]Failed to fetch VM details (HTTP $HTTP_CODE)"
-                echo "$VM_DATA" | jq '.' 2>/dev/null || echo "$VM_DATA"
-                exit 1
-              fi
 
               VM_UUID=$(echo "$VM_DATA" | jq -r '.metadata.uuid')
               VM_NAME=$(echo "$VM_DATA" | jq -r '.spec.name')
@@ -282,6 +483,9 @@ stages:
               NUTANIX_ENDPOINT: $(NUTANIX_ENDPOINT)
               NUTANIX_USERNAME: $(NUTANIX_USERNAME)
               NUTANIX_PASSWORD: $(NUTANIX_PASSWORD)
+              USE_SECONDARY_PRISM: ${{ parameters.USE_SECONDARY_PRISM }}
+              TEST_ENV: ${{ parameters.TEST_ENV }}
+              PRISM_SECONDARY_URL: $(selectPrism.PRISM_SECONDARY_URL)
 
           - bash: |
               set -e
@@ -305,6 +509,25 @@ stages:
                 echo "Requested CPU: $CPU_NUM (current: $CURRENT_TOTAL_CPU)"
                 if [ "$CPU_NUM" -ne "$CURRENT_TOTAL_CPU" ]; then
                   CPU_DIFFERS=true
+                  
+                  # check for potential downsizing on PRD VMs and prevent if not explicitly allowed (either TEST_ENV=true or ALLOW_PRD_VM_DOWNGRADE=true)
+                  if [ "$TEST_ENV" = "False" ] && [ "$ALLOW_PRD_VM_DOWNGRADE" = "False" ] && [ "$CPU_NUM" -lt "$CURRENT_TOTAL_CPU" ]; then
+                    echo "##vso[task.logissue type=error]❌ Downgrading CPU on PRD VMs is not allowed. Current CPU: $CURRENT_TOTAL_CPU, Requested CPU: $CPU_NUM. To allow downgrades, set ALLOW_PRD_VM_DOWNGRADE=true (not recommended)."
+                    exit 1
+                  fi
+                  
+                  # check for potential downsizing on PRD warn if not explicitly allowed (TEST_ENV=false and ALLOW_PRD_VM_DOWNGRADE=true) 
+                  if [ "$TEST_ENV" = "False" ] && [ "$ALLOW_PRD_VM_DOWNGRADE" = "True" ] && [ "$CPU_NUM" -lt "$CURRENT_TOTAL_CPU" ]; then
+                    echo "##vso[task.logissue type=warning]⚠️ Downgrading CPU on PRD VMs is potentially risky and not recommended. Current CPU: $CURRENT_TOTAL_CPU, Requested CPU: $CPU_NUM. To prevent downgrades, set ALLOW_PRD_VM_DOWNGRADE=false."
+                    echo "##vso[task.setvariable variable=DOWNGRADE_RESIZE;isOutput=true]true"
+                  fi
+
+                  # check for potential downsizing on TEST VMs and warn.
+                  if [ "$TEST_ENV" = "True" ] && [ "$CPU_NUM" -lt "$CURRENT_TOTAL_CPU" ]; then
+                    echo "##vso[task.logissue type=warning]⚠️ Downgrading CPU on TEST VMs is not recommended. Current CPU: $CURRENT_TOTAL_CPU, Requested CPU: $CPU_NUM."
+                    echo "##vso[task.setvariable variable=DOWNGRADE_RESIZE;isOutput=true]true"
+                  fi
+
                 fi
               else
                 echo "CPU not requested → skipping CPU comparison"
@@ -314,6 +537,25 @@ stages:
                 echo "Requested Memory: ${MEMORY_GB}GB (current: ${CURRENT_MEMORY_GB}GB)"
                 if [ "$MEMORY_GB" -ne "$CURRENT_MEMORY_GB" ]; then
                   MEMORY_DIFFERS=true
+
+                  # check for potential downsizing on PRD VMs and prevent if not explicitly allowed (either TEST_ENV=true or ALLOW_PRD_VM_DOWNGRADE=true)
+                  if [ "$TEST_ENV" = "False" ] && [ "$ALLOW_PRD_VM_DOWNGRADE" = "False" ] && [ "$MEMORY_GB" -lt "$CURRENT_MEMORY_GB" ]; then
+                    echo "##vso[task.logissue type=error]❌ Downgrading Memory on PRD VMs is not allowed. Current Memory: ${CURRENT_MEMORY_GB}GB, Requested Memory: ${MEMORY_GB}GB. To allow downgrades, set ALLOW_PRD_VM_DOWNGRADE=true (not recommended)."
+                    exit 1
+                  fi
+                  
+                  # check for potential downsizing on PRD warn if not explicitly allowed (TEST_ENV=false and ALLOW_PRD_VM_DOWNGRADE=true) 
+                  if [ "$TEST_ENV" = "False" ] && [ "$ALLOW_PRD_VM_DOWNGRADE" = "True" ] && [ "$MEMORY_GB" -lt "$CURRENT_MEMORY_GB" ]; then
+                    echo "##vso[task.logissue type=warning]⚠️ Downgrading Memory on PRD VMs is potentially risky and not recommended. Current Memory: ${CURRENT_MEMORY_GB}GB, Requested Memory: ${MEMORY_GB}GB. To prevent downgrades, set ALLOW_PRD_VM_DOWNGRADE=false."
+                    echo "##vso[task.setvariable variable=DOWNGRADE_RESIZE;isOutput=true]true"
+                  fi
+
+                  # check for potential downsizing on TEST VMs and warn.
+                  if [ "$TEST_ENV" = "True" ] && [ "$MEMORY_GB" -lt "$CURRENT_MEMORY_GB" ]; then
+                    echo "##vso[task.logissue type=warning]⚠️ Downgrading Memory on TEST VMs is not recommended. Current Memory: ${CURRENT_MEMORY_GB}GB, Requested Memory: ${MEMORY_GB}GB."
+                    echo "##vso[task.setvariable variable=DOWNGRADE_RESIZE;isOutput=true]true"
+                  fi
+
                 fi
               else
                 echo "Memory not requested → skipping memory comparison"
@@ -332,7 +574,7 @@ stages:
 
 
       # ----------------------------------------------------------------------------------------------
-      # 3) Resize the VM 
+      # 4) Resize the VM 
       # ----------------------------------------------------------------------------------------------
       - job: ResizeVM
         displayName: 'Resize VM'
@@ -355,7 +597,7 @@ stages:
           ${{ else }}:
             NUTANIX_USERNAME: $(PRISM_USERNAME)
             NUTANIX_PASSWORD: $(PRISM_PASSWORD)
-            NUTANIX_ENDPOINT: $(PRISM_ELEMENT_FQDN)
+            NUTANIX_ENDPOINT: $[ dependencies.ValidateSpec.outputs['selectPrism.PRISM_URL'] ]
             vm_uuid: $[ dependencies.ValidateSpec.outputs['getVm.vm_uuid'] ]
             vm_name: $[ dependencies.ValidateSpec.outputs['getVm.vm_name'] ]
             power_state: $[ dependencies.ValidateSpec.outputs['getVm.power_state'] ]
@@ -384,7 +626,9 @@ stages:
                 echo "   Note: Some VM properties can only be modified when powered OFF"
               fi
 
-              if [ "$POWER_STATE" = "ON" ] && [ "$STOP_VM" = "true" ]; then
+              # if vm is on and stop_vm is true or if vm is on and DOWNGRADE_RESIZE is true (potentially risky operation) then stop the vm before resize, otherwise proceed with the resize and skip the stop operation
+              
+              if [ "$POWER_STATE" = "ON" ] && { [ "$STOP_VM" = "true" ] || [ "$DOWNGRADE_RESIZE" = "true" ]; }; then
                 echo ">>> Stopping VM before resize..."
 
                 STOP_RESPONSE=$(curl -s -k -w "\n%{http_code}" \
@@ -410,7 +654,7 @@ stages:
                   VM_GET_HTTP=$(echo "$VM_GET_RESPONSE" | tail -n1)
                   VM_GET_BODY=$(echo "$VM_GET_RESPONSE" | sed '$d')
                   if [ "$VM_GET_HTTP" -lt 200 ] || [ "$VM_GET_HTTP" -ge 300 ]; then
-                    echo "##vso[task.logissue type=error]Fallback GET VM failed (HTTP $VM_GET_HTTP)"
+                    echo "##vso[task.logissue type=error]❌ Fallback GET VM failed (HTTP $VM_GET_HTTP)"
                     echo "$VM_GET_BODY" | jq '.' || echo "$VM_GET_BODY"
                     exit 1
                   fi
@@ -429,14 +673,14 @@ stages:
                 fi
 
                 if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
-                  echo "##vso[task.logissue type=error]Failed to send stop request (HTTP $HTTP_CODE)"
+                  echo "##vso[task.logissue type=error]❌ Failed to send stop request (HTTP $HTTP_CODE)"
                   echo "$RESPONSE_BODY" | jq '.' || echo "$RESPONSE_BODY"
                   exit 1
                 fi
 
                 TASK_UUID=$(echo "$RESPONSE_BODY" | jq -r '.status.execution_context.task_uuid // empty')
                 if [ -z "$TASK_UUID" ]; then
-                  echo "##vso[task.logissue type=error]Stop task UUID was not returned"
+                  echo "##vso[task.logissue type=error]❌ Stop task UUID was not returned"
                   exit 1
                 fi
 
@@ -461,7 +705,7 @@ stages:
                       break
                       ;;
                     FAILED)
-                      echo "##vso[task.logissue type=error]VM stop task failed"
+                      echo "##vso[task.logissue type=error]❌ VM stop task failed"
                       echo "$TASK_RESPONSE" | jq '.'
                       exit 1
                       ;;
@@ -477,8 +721,9 @@ stages:
                   echo "##vso[task.logissue type=error]Timed out waiting for VM stop task"
                   exit 1
                 fi
-              elif [ "$POWER_STATE" = "ON" ] && [ "$STOP_VM" != "true" ]; then
-                echo "ℹ️  VM is ON and stop_vm=false, proceeding without stopping"
+               ng
+              elif [ "$POWER_STATE" = "ON" ] && [ "$STOP_VM" != "true" ] && [ "$DOWNGRADE_RESIZE" != "true" ]; then
+                echo "ℹ️  VM is ON, stop_vm=false and DOWNGRADE_RESIZE=false → proceeding without stopping"
               else
                 echo "ℹ️  VM is not ON, no stop action needed"
               fi
@@ -488,6 +733,8 @@ stages:
               NUTANIX_ENDPOINT: $(NUTANIX_ENDPOINT)
               NUTANIX_USERNAME: $(NUTANIX_USERNAME)
               NUTANIX_PASSWORD: $(NUTANIX_PASSWORD)
+              DOWNGRADE_RESIZE: ${{ dependencies.ValidateSpec.outputs['validateSpec.DOWNGRADE_RESIZE'] }}
+              STOP_VM: ${{ parameters.STOP_VM }}
 
           - bash: |
               set -e
@@ -506,7 +753,7 @@ stages:
               LATEST_HTTP_CODE=$(echo "$LATEST_VM_RESPONSE" | tail -n1)
               VM_DATA=$(echo "$LATEST_VM_RESPONSE" | sed '$d')
               if [ "$LATEST_HTTP_CODE" -lt 200 ] || [ "$LATEST_HTTP_CODE" -ge 300 ]; then
-                echo "##vso[task.logissue type=error]Failed to refresh VM details before resize (HTTP $LATEST_HTTP_CODE)"
+                echo "##vso[task.logissue type=error]❌ Failed to refresh VM details before resize (HTTP $LATEST_HTTP_CODE)"
                 echo "$VM_DATA" | jq '.' || echo "$VM_DATA"
                 exit 1
               fi
@@ -569,7 +816,7 @@ stages:
                 echo "##vso[task.setvariable variable=new_sockets;isOutput=true]$NEW_SOCKETS"
                 echo "##vso[task.setvariable variable=new_vcpus_per_socket;isOutput=true]$NEW_VCPUS_PER_SOCKET"
               else
-                echo "##vso[task.logissue type=error]Failed to resize VM (HTTP $HTTP_CODE)"
+                echo "##vso[task.logissue type=error]❌ Failed to resize VM (HTTP $HTTP_CODE)"
                 echo "$RESPONSE_BODY" | jq '.' || echo "$RESPONSE_BODY"
                 exit 1
               fi
@@ -679,15 +926,14 @@ stages:
               fi
 
               if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
-                echo "##vso[task.logissue type=error]Failed to send start request (HTTP $HTTP_CODE)"
+                echo "##vso[task.logissue type=error]❌ Failed to send start request (HTTP $HTTP_CODE)"
                 echo "$RESPONSE_BODY" | jq '.' || echo "$RESPONSE_BODY"
                 exit 1
               fi
 
               TASK_UUID=$(echo "$RESPONSE_BODY" | jq -r '.status.execution_context.task_uuid // empty')
               if [ -z "$TASK_UUID" ]; then
-                echo "##vso[task.logissue type=error]Start task UUID was not returned"
-                exit 1
+                echo "##vso[task.logissue type=error]❌ Start task UUID was not returned"
               fi
 
               echo ">>> Monitoring start task: $TASK_UUID"
