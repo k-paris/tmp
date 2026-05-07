@@ -1,3 +1,13 @@
+# =====================================================================
+#
+# Powercycles a Nutanix VM (start / stop / restart) via direct Prism v3
+# API calls. Credentials are retrieved from CyberArk through the existing
+# Templates/cyberarkAuth.yaml job (which exports NUTANIX_USERNAME,
+# NUTANIX_PASSWORD as job-output variables) when use_cyberArk=true,
+# otherwise PRISM_USERNAME/PRISM_PASSWORD from the variable group are
+# used.
+# =====================================================================
+
 parameters:
 
   - name: VM_NAME
@@ -11,8 +21,9 @@ parameters:
     default: ''
 
   - name: POWER_ACTION
-    displayName: 'Power action to perform'
+    displayName: 'Power action to perform on the VM'
     type: string
+    default: 'ON'
     values:
       - 'ON'
       - 'OFF'
@@ -23,583 +34,962 @@ parameters:
     type: boolean
     default: false
 
+  - name: TEST_ENV
+    type: boolean
+    default: false
+
   - name: TEST_RUN
     type: boolean
     default: true
+
+  - name: USE_SECONDARY_PRISM
+    type: boolean
+    default: false
 
 
 trigger: none
 
 pool: self-hosted-ubuntu
 
-name: 'VM Power Cycle - $(Date:yyyyMMdd)$(Rev:.r) Action: ${{ parameters.POWER_ACTION }}'
+name: 'VM Powercycle | ${{ coalesce(parameters.VM_NAME, parameters.VM_UUID) }} | ${{ parameters.POWER_ACTION }}'
 
-
+# Credentials and CyberArk configuration are pulled from this variable group:
+#   - When use_cyberArk = false: PRISM_USERNAME, PRISM_PASSWORD,
+#                                PRISM_TST_URL, PRISM_DMZ_URL, PRISM_LAN_URL
+#                                (the endpoint is selected at runtime by the
+#                                SelectPrismURL step based on TEST_ENV/VM_NAME)
+#   - When use_cyberArk = true:  CYBERARK_CCP_URL, CYBERARK_APP_ID, CYBERARK_SAFE,
+#                                CYBERARK_OBJECT, NUTANIX_CLUSTER_URL,
+#                                CYBERARK_CLIENT_CERT_PATH
+# In both cases values are remapped onto NUTANIX_USERNAME / NUTANIX_PASSWORD /
+# NUTANIX_ENDPOINT at job scope below so that the bash steps stay identical
+# regardless of the credential source.
 variables:
   - group: ccoe-nutanix-automation
 
 
 stages:
-  - stage: PowerCycleVM
-    displayName: 'Power Cycle Nutanix VM'
+  - stage: PowercycleVM
+    displayName: 'Powercycle Nutanix VM'
 
     jobs:
 
-    # ----------------------------------------------------------------------------------------------
-    # 1) (Optional until CyberArk integration is complete) Fetch Nutanix credentials from CyberArk
-    # ----------------------------------------------------------------------------------------------
-    - ${{ if eq(parameters.use_cyberArk, true) }}:
-        - template: ../Templates/cyberarkAuth.yaml
-          parameters:
-            dependsOn: ValidateInputParameters
-            cyberark_ccp_url: $(CYBERARK_CCP_URL)
-            cyberark_app_id: $(CYBERARK_APP_ID)
-            cyberark_safe: $(CYBERARK_SAFE)
-            cyberark_object: $(CYBERARK_OBJECT)
-            nutanix_cluster_url: $(NUTANIX_CLUSTER_URL)
-            cyberark_client_cert_path: $(CYBERARK_CLIENT_CERT_PATH)
-            TEST_RUN: ${{ parameters.TEST_RUN }}
-
-    
-    # ----------------------------------------------------------------------------------------------
-    # 2) Validate that the requested spec differs from the current one 
-    # ----------------------------------------------------------------------------------------------
-    - job: ValidateSpec
-      displayName: 'Validate current spec'
-      dependsOn:
-        - ValidateInputParameters
-        - ${{ if eq(parameters.use_cyberArk, true) }}:
-            - CyberArkAuth
-      variables:
-        ${{ if eq(parameters.use_cyberArk, true) }}:
-          NUTANIX_USERNAME: $[ dependencies.CyberArkAuth.outputs['retrieveCredentials.NUTANIX_USERNAME'] ]
-          NUTANIX_PASSWORD: $[ dependencies.CyberArkAuth.outputs['retrieveCredentials.NUTANIX_PASSWORD'] ]
-          NUTANIX_ENDPOINT: $[ dependencies.CyberArkAuth.outputs['retrieveCredentials.NUTANIX_ENDPOINT'] ]
-        ${{ else }}:
-          NUTANIX_USERNAME: $(PRISM_USERNAME)
-          NUTANIX_PASSWORD: $(PRISM_PASSWORD)
-          # NUTANIX_ENDPOINT is set dynamically by the SelectPrismURL step below.
-      steps:
-
-        - ${{ if eq(parameters.use_cyberArk, false) }}:
+      # ----------------------------------------------------------------------------------------------
+      # 1) Validate input parameters (VM identifier + POWER_ACTION)
+      # ----------------------------------------------------------------------------------------------
+      - job: ValidateInputParameters
+        displayName: 'Validate Input Parameters'
+        steps:
           - bash: |
               set -e
 
-              TEST_RUN="${{ lower(parameters.TEST_RUN) }}"
+              RESPONSE_MSG=""
+
               VM_NAME="${{ parameters.VM_NAME }}"
               VM_UUID="${{ parameters.VM_UUID }}"
+              POWER_ACTION="${{ parameters.POWER_ACTION }}"
+
+              echo "Provided VM_NAME:     '${VM_NAME}'"
+              echo "Provided VM_UUID:     '${VM_UUID}'"
+              echo "Provided POWER_ACTION:'${POWER_ACTION}'"
+
+              if [ -z "$VM_NAME" ] && [ -z "$VM_UUID" ]; then
+                RESPONSE_MSG="Either VM_NAME or VM_UUID must be specified"
+                echo "##vso[task.logissue type=error]❌ $RESPONSE_MSG"
+                echo "##vso[task.setvariable variable=RESPONSE_MSG;isOutput=true]$RESPONSE_MSG"
+                exit 1
+              fi
+
+              case "$POWER_ACTION" in
+                ON|OFF|RESTART)
+                  echo "✅ POWER_ACTION '$POWER_ACTION' is valid"
+                  ;;
+                *)
+                  RESPONSE_MSG="POWER_ACTION must be one of ON, OFF, RESTART (got: '$POWER_ACTION')"
+                  echo "##vso[task.logissue type=error]❌ $RESPONSE_MSG"
+                  echo "##vso[task.setvariable variable=RESPONSE_MSG;isOutput=true]$RESPONSE_MSG"
+                  exit 1
+                  ;;
+              esac
+
+              echo "✅ Input parameter validation passed"
+
+              # -----------  Output variables  --------------
+
+              # Output Response Message (should be empty if everything is correct)
+              echo "##vso[task.setvariable variable=RESPONSE_MSG;isOutput=true]$RESPONSE_MSG"
+            name: validateInput
+            displayName: 'Validate VM identifier and POWER_ACTION'
+
+      # ----------------------------------------------------------------------------------------------
+      # 2) (Optional until CyberArk integration is complete) Fetch Nutanix credentials from CyberArk
+      # ----------------------------------------------------------------------------------------------
+      - ${{ if eq(parameters.use_cyberArk, true) }}:
+          - template: ../Templates/cyberarkAuth.yaml
+            parameters:
+              dependsOn: ValidateInputParameters
+              cyberark_ccp_url: $(CYBERARK_URL)
+              cyberark_app_id: $(CYBERARK_APP_ID)
+              cyberark_safe: $(CYBERARK_SAFE)
+              cyberark_object: $(CYBERARK_OBJECT)
+              cyberark_client_cert_path: $(CYBERARK_CLIENT_CERT_PATH)
+
+
+      # ----------------------------------------------------------------------------------------------
+      # 3) Resolve Prism endpoint, validate credentials, fetch VM details and decide whether the
+      #    requested POWER_ACTION is needed (no-op when VM is already in the desired state).
+      # ----------------------------------------------------------------------------------------------
+      - job: ValidateVm
+        displayName: 'Validate VM and target power state'
+        dependsOn:
+          - ValidateInputParameters
+          - ${{ if eq(parameters.use_cyberArk, true) }}:
+              - CyberArkAuth
+        variables:
+          ${{ if eq(parameters.use_cyberArk, true) }}:
+            NUTANIX_USERNAME: $[ dependencies.CyberArkAuth.outputs['retrieveCredentials.NUTANIX_USERNAME'] ]
+            NUTANIX_PASSWORD: $[ dependencies.CyberArkAuth.outputs['retrieveCredentials.NUTANIX_PASSWORD'] ]
+          ${{ else }}:
+            NUTANIX_USERNAME: $(PRISM_USERNAME)
+            NUTANIX_PASSWORD: $(PRISM_PASSWORD)
+            # NUTANIX_ENDPOINT is set dynamically by the SelectPrismURL step below.
+        steps:
+
+          - bash: |
+              set -e
+
+              RESPONSE_MSG=""
+
+              TEST_ENV="${{ lower(parameters.TEST_ENV) }}"
+              VM_NAME="${{ parameters.VM_NAME }}"
+              VM_UUID="${{ parameters.VM_UUID }}"
+              PRISM_URL=""
+              SECONDARY_URL=""
 
               echo "========================================"
               echo "  Selecting Prism Endpoint"
               echo "========================================"
-              echo "  TEST_RUN: $TEST_RUN"
+              echo "  TEST_ENV: $TEST_ENV"
               echo "  VM_NAME:  $VM_NAME"
               echo "  VM_UUID:  $VM_UUID"
 
-              if [ "$TEST_RUN" = "true" ]; then
-                PRISM_URL="$(PRISM_TST_URL)"
-                echo "TEST_RUN=true → using test cluster: $PRISM_URL"
+              if [ "$TEST_ENV" = "true" ]; then
+                PRISM_URL="$PRISM_TST_URL"
+                echo "ℹ️ TEST_ENV=true → using test cluster: $PRISM_URL"
               else
                 if [ -z "$VM_NAME" ]; then
-                  echo "##vso[task.logissue type=error]VM_NAME is required to select the Prism endpoint when TEST_RUN=false (cluster zone is encoded in the VM name)."
+                  RESPONSE_MSG="VM_NAME is required to select the Prism endpoint when TEST_ENV=false (cluster zone is encoded in the VM name)."
+                  echo "##vso[task.logissue type=error]❌ $RESPONSE_MSG"
+                  echo "##vso[task.setvariable variable=RESPONSE_MSG;isOutput=true]$RESPONSE_MSG"
                   exit 1
                 fi
 
                 # Naming convention: X[W|L][10|16][D|L]...
                 if ! echo "$VM_NAME" | grep -Eq '^X[WL](10|16)[DL].*'; then
-                  echo "##vso[task.logissue type=error]VM_NAME '$VM_NAME' does not match expected naming convention X[W|L][10|16][D|L]..."
+                  RESPONSE_MSG="VM_NAME '$VM_NAME' does not match expected naming convention X[W|L][10|16][D|L]..."
+                  echo "##vso[task.logissue type=error]❌ $RESPONSE_MSG"
+                  echo "##vso[task.setvariable variable=RESPONSE_MSG;isOutput=true]$RESPONSE_MSG"
                   exit 1
                 fi
 
                 ZONE_CHAR=$(echo "$VM_NAME" | cut -c5)
                 case "$ZONE_CHAR" in
-                  D) PRISM_URL="$(PRISM_DMZ_URL)" ; ZONE="DMZ" ;;
-                  L) PRISM_URL="$(PRISM_LAN_URL)" ; ZONE="LAN" ;;
+                  D) PRISM_URL="$PRISM_DMZ_URL" ; ZONE="DMZ" ; SECONDARY_URL="$PRISM_LAN_URL" ;;
+                  L) PRISM_URL="$PRISM_LAN_URL" ; ZONE="LAN" ; SECONDARY_URL="$PRISM_DMZ_URL" ;;
                   *)
-                    echo "##vso[task.logissue type=error]Unrecognized zone character '$ZONE_CHAR' in VM_NAME '$VM_NAME' (expected D or L)."
+                    RESPONSE_MSG="Unrecognized zone character '$ZONE_CHAR' in VM_NAME '$VM_NAME' (expected D or L)."
+                    echo "##vso[task.logissue type=error]❌ $RESPONSE_MSG"
+                    echo "##vso[task.setvariable variable=RESPONSE_MSG;isOutput=true]$RESPONSE_MSG"
                     exit 1
                     ;;
                 esac
-                echo "Detected zone: $ZONE → using $PRISM_URL"
+                echo "ℹ️ Detected zone: $ZONE → using $PRISM_URL"
               fi
 
               if [ -z "$PRISM_URL" ]; then
-                echo "##vso[task.logissue type=error]Resolved Prism URL is empty. Verify variable group keys: PRISM_TST_URL / PRISM_DMZ_URL / PRISM_LAN_URL."
+                RESPONSE_MSG="Resolved Prism URL is empty. Verify variable group keys: PRISM_TST_URL / PRISM_DMZ_URL / PRISM_LAN_URL."
+                echo "##vso[task.logissue type=error]❌ $RESPONSE_MSG"
+                echo "##vso[task.setvariable variable=RESPONSE_MSG;isOutput=true]$RESPONSE_MSG"
                 exit 1
               fi
 
-              # Output variable for downstream jobs.
+              echo "✅ Prism endpoint selection passed"
+
+              # -----------  Output variables  --------------
+
+              # Prism Endpoint URLs (primary and secondary for failover if applicable)
               echo "##vso[task.setvariable variable=PRISM_URL;isOutput=true]$PRISM_URL"
+              echo "##vso[task.setvariable variable=PRISM_SECONDARY_URL;isOutput=true]$SECONDARY_URL"
+
               # Override NUTANIX_ENDPOINT for the remaining steps in this job.
               echo "##vso[task.setvariable variable=NUTANIX_ENDPOINT]$PRISM_URL"
+
+              # Output Response Message (should be empty if everything is correct)
+              echo "##vso[task.setvariable variable=RESPONSE_MSG;isOutput=true]$RESPONSE_MSG"
             name: selectPrism
-            displayName: 'SelectPrismURL'
+            displayName: 'Select Prism URL'
+            env:
+              PRISM_TST_URL: $(PRISM_TST_URL)
+              PRISM_DMZ_URL: $(PRISM_DMZ_URL)
+              PRISM_LAN_URL: $(PRISM_LAN_URL)
 
-        - bash: |
-            set -e
+          - bash: |
+              set -e
+              source "$(Build.SourcesDirectory)/Scripts/Bash/response_msg_helpers.sh"
 
-            API_URL="https://${NUTANIX_ENDPOINT}:9440/api/nutanix/v3/clusters/list"
+              RESPONSE_MSG=""
 
-            AUTH_RESPONSE=$(curl -s -k -w "\n%{http_code}" \
-              -X POST \
-              -H "Content-Type: application/json" \
-              -u "${NUTANIX_USERNAME}:${NUTANIX_PASSWORD}" \
-              -d '{"kind": "cluster", "length": 1}' \
-              "$API_URL")
+              API_URL="https://${NUTANIX_ENDPOINT}:9440/api/nutanix/v3/clusters/list"
 
-            HTTP_CODE=$(echo "$AUTH_RESPONSE" | tail -n1)
-            RESPONSE_BODY=$(echo "$AUTH_RESPONSE" | sed '$d')
-
-            if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
-              echo "Prism authentication check passed"
-              exit 0
-            fi
-
-            if [ "$HTTP_CODE" = "401" ]; then
-              echo "##vso[task.logissue type=error]Prism authentication failed (HTTP 401). Verify NUTANIX_USERNAME and NUTANIX_PASSWORD."
-            else
-              echo "##vso[task.logissue type=error]Prism preflight check failed (HTTP $HTTP_CODE). Verify endpoint/credentials/network."
-            fi
-
-            echo "$RESPONSE_BODY" | jq '.' 2>/dev/null || echo "$RESPONSE_BODY"
-            exit 1
-          displayName: 'Validate Prism authentication'
-          env:
-            NUTANIX_ENDPOINT: $(NUTANIX_ENDPOINT)
-            NUTANIX_USERNAME: $(NUTANIX_USERNAME)
-            NUTANIX_PASSWORD: $(NUTANIX_PASSWORD)
-
-        - bash: |
-            set -e
-
-            VM_NAME="${{ parameters.VM_NAME }}"
-            VM_UUID="${{ parameters.VM_UUID }}"
-            API_URL="https://${NUTANIX_ENDPOINT}:9440/api/nutanix/v3"
-
-            echo "========================================="
-            echo "  Getting VM Details"
-            echo "========================================="
-
-            if [ -z "$VM_NAME" ] && [ -z "$VM_UUID" ]; then
-              echo "##vso[task.logissue type=error]Either VM_NAME or VM_UUID is required"
-              exit 1
-            fi
-
-            if [ -n "$VM_UUID" ]; then
-              echo ">>> Searching by UUID: $VM_UUID"
-              VM_RESPONSE=$(curl -s -k -w "\n%{http_code}" \
-                -X GET \
-                -H "Content-Type: application/json" \
-                -u "${NUTANIX_USERNAME}:${NUTANIX_PASSWORD}" \
-                "${API_URL}/vms/${VM_UUID}")
-            else
-              echo ">>> Searching by name: $VM_NAME"
-              VM_LIST_RESPONSE=$(curl -s -k -w "\n%{http_code}" \
+              AUTH_RESPONSE=$(curl -s -k -w "\n%{http_code}" \
                 -X POST \
                 -H "Content-Type: application/json" \
                 -u "${NUTANIX_USERNAME}:${NUTANIX_PASSWORD}" \
-                -d "{\"kind\": \"vm\", \"filter\": \"vm_name==${VM_NAME}\"}" \
-                "${API_URL}/vms/list")
+                -d '{"kind": "cluster", "length": 1}' \
+                "$API_URL")
 
-              HTTP_CODE=$(echo "$VM_LIST_RESPONSE" | tail -n1)
-              RESPONSE_BODY=$(echo "$VM_LIST_RESPONSE" | sed '$d')
+              HTTP_CODE=$(echo "$AUTH_RESPONSE" | tail -n1)
+              RESPONSE_BODY=$(echo "$AUTH_RESPONSE" | sed '$d')
 
               if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
-                MATCH_COUNT=$(echo "$RESPONSE_BODY" | jq --arg n "$VM_NAME" '[.entities[] | select(.spec.name == $n)] | length')
-                if [ "$MATCH_COUNT" -gt 1 ]; then
-                  echo "##vso[task.logissue type=error]Found $MATCH_COUNT VMs with name '$VM_NAME'. Please specify VM_UUID instead to disambiguate."
-                  echo "$RESPONSE_BODY" | jq --arg n "$VM_NAME" '[.entities[] | select(.spec.name == $n)] | .[] | {name: .spec.name, uuid: .metadata.uuid}'
-                  exit 1
-                fi
-                ENTITY=$(echo "$RESPONSE_BODY" | jq --arg n "$VM_NAME" '[.entities[] | select(.spec.name == $n)] | .[0]')
-                if [ "$ENTITY" = "null" ] || [ -z "$ENTITY" ]; then
-                  echo "##vso[task.logissue type=error]VM not found: $VM_NAME"
-                  exit 1
-                fi
-                VM_RESPONSE=$(printf "%s\n%s" "$ENTITY" "$HTTP_CODE")
+                echo "✅ Prism authentication check passed"
+                echo "##vso[task.setvariable variable=RESPONSE_MSG;isOutput=true]$RESPONSE_MSG"
+                exit 0
+              fi
+
+              if [ "$HTTP_CODE" = "401" ]; then
+                emit_api_error "Prism authentication failed (HTTP 401). Verify NUTANIX_USERNAME and NUTANIX_PASSWORD." "$RESPONSE_BODY"
+                exit 1
               else
-                echo "##vso[task.logissue type=error]Failed to search VM by name (HTTP $HTTP_CODE)"
-                echo "$RESPONSE_BODY" | jq '.' 2>/dev/null || echo "$RESPONSE_BODY"
+                emit_api_error "Prism preflight check failed (HTTP $HTTP_CODE). Verify endpoint/credentials/network." "$RESPONSE_BODY"
                 exit 1
               fi
-            fi
+            name: validatePrismAuth
+            displayName: 'Validate Prism authentication'
+            env:
+              NUTANIX_ENDPOINT: $(NUTANIX_ENDPOINT)
+              NUTANIX_USERNAME: $(NUTANIX_USERNAME)
+              NUTANIX_PASSWORD: $(NUTANIX_PASSWORD)
 
-            HTTP_CODE=$(echo "$VM_RESPONSE" | tail -n1)
-            VM_DATA=$(echo "$VM_RESPONSE" | sed '$d')
+          - bash: |
+              set -e
+              source "$(Build.SourcesDirectory)/Scripts/Bash/response_msg_helpers.sh"
 
-            if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
-              echo "##vso[task.logissue type=error]Failed to fetch VM details (HTTP $HTTP_CODE)"
-              echo "$VM_DATA" | jq '.' 2>/dev/null || echo "$VM_DATA"
-              exit 1
-            fi
+              RESPONSE_MSG=""
+              SEARCH_HTTP_CODE=""
+              SEARCH_RESPONSE_BODY=""
 
-            VM_UUID=$(echo "$VM_DATA" | jq -r '.metadata.uuid')
-            VM_NAME=$(echo "$VM_DATA" | jq -r '.spec.name')
-            CURRENT_VCPUS=$(echo "$VM_DATA" | jq -r '.spec.resources.num_vcpus_per_socket')
-            CURRENT_SOCKETS=$(echo "$VM_DATA" | jq -r '.spec.resources.num_sockets')
-            CURRENT_MEMORY_MIB=$(echo "$VM_DATA" | jq -r '.spec.resources.memory_size_mib')
-            CURRENT_MEMORY_GB=$((CURRENT_MEMORY_MIB / 1024))
-            POWER_STATE=$(echo "$VM_DATA" | jq -r '.spec.resources.power_state')
+              VM_NAME="${{ parameters.VM_NAME }}"
+              VM_UUID="${{ parameters.VM_UUID }}"
+              API_URL="https://${NUTANIX_ENDPOINT}:9440/api/nutanix/v3"
 
-            echo "✅ VM Found!"
-            echo "  Name: $VM_NAME"
-            echo "  UUID: $VM_UUID"
-            echo "  Power State: $POWER_STATE"
-            echo "  Current vCPUs/socket: $CURRENT_VCPUS"
-            echo "  Current Sockets: $CURRENT_SOCKETS"
-            echo "  Current Memory: ${CURRENT_MEMORY_GB}GB"
+              echo "========================================="
+              echo "  Getting VM Details"
+              echo "========================================="
 
-            # Persist outputs for downstream steps and the ResizeVM job
-            echo "##vso[task.setvariable variable=vm_uuid;isOutput=true]$VM_UUID"
-            echo "##vso[task.setvariable variable=vm_name;isOutput=true]$VM_NAME"
-            echo "##vso[task.setvariable variable=current_vcpus;isOutput=true]$CURRENT_VCPUS"
-            echo "##vso[task.setvariable variable=current_sockets;isOutput=true]$CURRENT_SOCKETS"
-            echo "##vso[task.setvariable variable=current_memory_gb;isOutput=true]$CURRENT_MEMORY_GB"
-            echo "##vso[task.setvariable variable=power_state;isOutput=true]$POWER_STATE"
-          name: getVm
-          displayName: 'Get VM details'
-          env:
-            NUTANIX_ENDPOINT: $(NUTANIX_ENDPOINT)
-            NUTANIX_USERNAME: $(NUTANIX_USERNAME)
-            NUTANIX_PASSWORD: $(NUTANIX_PASSWORD)
+              if [ -n "$VM_UUID" ]; then
+                echo ">>> Searching by UUID: $VM_UUID"
+                VM_RESPONSE=$(curl -s -k -w "\n%{http_code}" \
+                  -X GET \
+                  -H "Content-Type: application/json" \
+                  -u "${NUTANIX_USERNAME}:${NUTANIX_PASSWORD}" \
+                  "${API_URL}/vms/${VM_UUID}")
 
-        - bash: |
-            set -e
+                HTTP_CODE=$(echo "$VM_RESPONSE" | tail -n1)
+                RESPONSE_BODY=$(echo "$VM_RESPONSE" | sed '$d')
 
-            POWER_ACTION="${{ parameters.POWER_ACTION }}"
-            CURRENT_POWER_STATE="$(getVm.power_state)"
+                VM_FOUND=false
 
-            echo "Requested action: $POWER_ACTION"
-            echo "Current power state: $CURRENT_POWER_STATE"
+                if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+                  VM_FOUND=true
+                elif [ "$HTTP_CODE" -ne 404 ]; then
+                  echo "##vso[task.logissue type=warning]⚠️ Failed to fetch VM by UUID '$VM_UUID' on ${NUTANIX_ENDPOINT} (HTTP $HTTP_CODE)"
+                  echo "$RESPONSE_BODY" | jq '.' 2>/dev/null || echo "$RESPONSE_BODY"
+                else
+                  echo "##vso[task.logissue type=warning]⚠️ VM with UUID '$VM_UUID' not found on primary Prism endpoint ${NUTANIX_ENDPOINT} (HTTP 404)."
+                fi
 
-            # RESTART must always run, regardless of current state.
-            if [ "$POWER_ACTION" = "RESTART" ]; then
-              echo "##vso[task.setvariable variable=spec_is_different;isOutput=true]true"
-              echo "✅ RESTART requested → action will be performed regardless of current state"
-              exit 0
-            fi
+                if [ "$VM_FOUND" = "false" ] && [ -n "$PRISM_SECONDARY_URL" ] && [ "$TEST_ENV" = "False" ]; then
+                  echo ">>> Retrying lookup on secondary Prism endpoint: $PRISM_SECONDARY_URL"
+                  SECONDARY_API_URL="https://${PRISM_SECONDARY_URL}:9440/api/nutanix/v3"
+                  VM_RESPONSE=$(curl -s -k -w "\n%{http_code}" \
+                    -X GET \
+                    -H "Content-Type: application/json" \
+                    -u "${NUTANIX_USERNAME}:${NUTANIX_PASSWORD}" \
+                    "${SECONDARY_API_URL}/vms/${VM_UUID}")
 
-            # For ON/OFF, skip if VM is already in the desired state.
-            if [ "$POWER_ACTION" = "$CURRENT_POWER_STATE" ]; then
-              echo "##vso[task.setvariable variable=spec_is_different;isOutput=true]false"
-              echo "ℹ️  No action needed. VM is already in the desired power state ($CURRENT_POWER_STATE)."
-              exit 0
-            fi
+                  HTTP_CODE=$(echo "$VM_RESPONSE" | tail -n1)
+                  RESPONSE_BODY=$(echo "$VM_RESPONSE" | sed '$d')
 
-            echo "##vso[task.setvariable variable=spec_is_different;isOutput=true]true"
-            echo "✅ Validation passed: current power state ($CURRENT_POWER_STATE) differs from requested ($POWER_ACTION)"
-          name: validateSpec
-          displayName: 'Validate requested spec differs from current'
+                  if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+                    VM_FOUND=true
+                    if [ "$USE_SECONDARY_PRISM" = "True" ]; then
+                      echo "✅ VM found on secondary Prism endpoint. Switching NUTANIX_ENDPOINT to $PRISM_SECONDARY_URL for subsequent steps."
+                      echo "##vso[task.setvariable variable=NUTANIX_ENDPOINT]$PRISM_SECONDARY_URL"
+                    else
+                      echo "##vso[task.logissue type=warning]⚠️ Warning: VM found on secondary Prism endpoint. VM was deployed not in the expected zone based on its name. Consider updating the naming convention or notify Platform Team to redeploy the VM. You can also set USE_SECONDARY_PRISM=true to automatically switch to the secondary endpoint and proceed with the pipeline."
+
+                      RESPONSE_MSG="VM found on secondary Prism endpoint. VM was deployed not in the expected zone based on its name. Exiting the pipeline due to VM being deployed in the wrong zone and USE_SECONDARY_PRISM set to false."
+                      echo "##vso[task.logissue type=error]❌ $RESPONSE_MSG"
+                      echo "##vso[task.setvariable variable=RESPONSE_MSG;isOutput=true]$RESPONSE_MSG"
+                      exit 1
+                    fi
+                  else
+                    emit_api_error "VM with UUID '$VM_UUID' not found either on primary or secondary Prism endpoint (HTTP $HTTP_CODE)." "$RESPONSE_BODY"
+                    exit 1
+                  fi
+                fi
+
+                if [ "$VM_FOUND" = "false" ]; then
+                  emit_api_error "VM with UUID '$VM_UUID' not found, exiting the pipeline !!!." "$RESPONSE_BODY"
+                  exit 1
+                fi
+
+              else
+                # Helper: query a Prism endpoint by VM_NAME and, on success, populate
+                # VM_RESPONSE / SEARCH_HTTP_CODE / SEARCH_RESPONSE_BODY in the caller's scope.
+                # Returns:
+                #   0 → VM found (VM_RESPONSE populated)
+                #   1 → API/transport error (SEARCH_HTTP_CODE / SEARCH_RESPONSE_BODY populated)
+                #   2 → Any other case — caller can print SEARCH_RESPONSE_BODY for debugging and should treat as "not found"
+                #   3 → ambiguous match (>1 VM with that name) — caller must abort
+                search_vm_by_name() {
+                  local _api_url="$1"
+                  local _resp _code _body _match
+
+                  _resp=$(curl -s -k -w "\n%{http_code}" \
+                    -X POST \
+                    -H "Content-Type: application/json" \
+                    -u "${NUTANIX_USERNAME}:${NUTANIX_PASSWORD}" \
+                    -d "{\"kind\": \"vm\", \"filter\": \"vm_name==${VM_NAME}\"}" \
+                    "${_api_url}/vms/list")
+
+                  _code=$(echo "$_resp" | tail -n1)
+                  _body=$(echo "$_resp" | sed '$d')
+
+                  SEARCH_HTTP_CODE="$_code"
+                  SEARCH_RESPONSE_BODY="$_body"
+
+                  if [ "$_code" -lt 200 ] || [ "$_code" -ge 300 ]; then
+                    return 1
+                  fi
+
+                  _match=$(echo "$_body" | jq '[.entities[] | select(.spec.name == "'"$VM_NAME"'")] | length')
+
+                  if [ "$_match" -gt 1 ]; then
+                    echo "##vso[task.logissue type=warning]⚠️ Found $_match VMs with name '$VM_NAME' on ${_api_url}. Please specify VM_UUID instead to disambiguate."
+                    echo "$_body" | jq '[.entities[] | select(.spec.name == "'"$VM_NAME"'")] | .[] | {name: .spec.name, uuid: .metadata.uuid}'
+                    return 3
+                  fi
+
+                  if [ "$_match" -eq 1 ]; then
+                    # Re-fetch the single matched VM by UUID to obtain a full v3 spec
+                    # (vms/list returns spec_list-style entries that don't include the
+                    # complete spec needed by downstream PUT calls).
+                    local _uuid
+                    _uuid=$(echo "$_body" | jq -r '[.entities[] | select(.spec.name == "'"$VM_NAME"'")] | .[0].metadata.uuid')
+                    VM_RESPONSE=$(curl -s -k -w "\n%{http_code}" \
+                      -X GET \
+                      -H "Content-Type: application/json" \
+                      -u "${NUTANIX_USERNAME}:${NUTANIX_PASSWORD}" \
+                      "${_api_url}/vms/${_uuid}")
+                    return 0
+                  fi
+
+                  echo "##vso[task.logissue type=warning]⚠️ VM '$VM_NAME' search error on ${_api_url}. VM not found or unexpected response format."
+                  echo "$_body" | jq '.' 2>/dev/null || echo "$_body"
+                  return 2
+                }
+
+                echo "=========================================================================================="
+                echo ">>> Searching by name: $VM_NAME on PRIMARY Prism endpoint ${NUTANIX_ENDPOINT}"
+                echo "=========================================================================================="
+
+                VM_FOUND=false
+                set +e
+                search_vm_by_name "$API_URL"
+                SEARCH_RC=$?
+                set -e
+
+                case "$SEARCH_RC" in
+                  0)
+                    VM_FOUND=true
+                    ;;
+                  1|2)
+                    echo "##vso[task.logissue type=warning]⚠️ Failed to search VM by name on ${NUTANIX_ENDPOINT} (HTTP $SEARCH_HTTP_CODE)."
+                    echo "$SEARCH_RESPONSE_BODY" | jq '.' 2>/dev/null || echo "$SEARCH_RESPONSE_BODY"
+                    ;;
+                  3)
+                    exit 1
+                    ;;
+                esac
+
+                if [ "$VM_FOUND" = "false" ] && [ -n "$PRISM_SECONDARY_URL" ] && [ "$TEST_ENV" = "False" ]; then
+
+                  echo "=========================================================================================="
+                  echo ">>> Retrying lookup on SECONDARY Prism endpoint: $PRISM_SECONDARY_URL"
+                  echo "=========================================================================================="
+
+                  SECONDARY_API_URL="https://${PRISM_SECONDARY_URL}:9440/api/nutanix/v3"
+
+                  set +e
+                  search_vm_by_name "$SECONDARY_API_URL"
+                  SEARCH_RC=$?
+                  set -e
+
+                  case "$SEARCH_RC" in
+                    0)
+                      VM_FOUND=true
+                      if [ "$USE_SECONDARY_PRISM" = "True" ]; then
+                        echo "✅ VM found on secondary Prism endpoint. Switching NUTANIX_ENDPOINT to $PRISM_SECONDARY_URL for subsequent steps."
+                        echo "##vso[task.setvariable variable=NUTANIX_ENDPOINT]$PRISM_SECONDARY_URL"
+                      else
+                        RESPONSE_MSG="Warning: VM found on secondary Prism endpoint. VM was deployed not in the expected zone based on its name. Consider updating the naming convention or notify Platform Team to redeploy the VM. You can also set USE_SECONDARY_PRISM=true to automatically switch to the secondary endpoint and proceed with the pipeline."
+                        echo "##vso[task.logissue type=warning]⚠️ $RESPONSE_MSG"
+                        RESPONSE_MSG="VM found on secondary Prism endpoint. VM was deployed not in the expected zone based on its name. Exiting the pipeline due to VM being deployed in the wrong zone and USE_SECONDARY_PRISM set to false."
+                        echo "##vso[task.logissue type=error]❌ $RESPONSE_MSG"
+                        echo "##vso[task.setvariable variable=RESPONSE_MSG;isOutput=true]$RESPONSE_MSG"
+                        exit 1
+                      fi
+                      ;;
+                    1|2)
+                      emit_api_error "Failed to search VM by name either on primary or secondary Prism endpoint (HTTP $SEARCH_HTTP_CODE)." "$SEARCH_RESPONSE_BODY"
+                      exit 1
+                      ;;
+                    3)
+                      exit 1
+                      ;;
+                  esac
+                fi
+
+                if [ "$VM_FOUND" = "false" ]; then
+                  emit_api_error "VM with name '$VM_NAME' not found on primary Prism endpoint ${NUTANIX_ENDPOINT}." "$SEARCH_RESPONSE_BODY"
+                  exit 1
+                fi
+              fi
+
+              VM_DATA=$(echo "$VM_RESPONSE" | sed '$d')
+
+              VM_UUID=$(echo "$VM_DATA" | jq -r '.metadata.uuid')
+              VM_NAME=$(echo "$VM_DATA" | jq -r '.spec.name')
+              POWER_STATE=$(echo "$VM_DATA" | jq -r '.spec.resources.power_state')
+
+              echo "✅ VM Found!"
+              echo "  Name: $VM_NAME"
+              echo "  UUID: $VM_UUID"
+              echo "  Power State: $POWER_STATE"
+
+              # -----------  Output variables  --------------
+
+              echo "##vso[task.setvariable variable=RESPONSE_MSG;isOutput=true]$RESPONSE_MSG"
+              echo "##vso[task.setvariable variable=vm_uuid;isOutput=true]$VM_UUID"
+              echo "##vso[task.setvariable variable=vm_name;isOutput=true]$VM_NAME"
+              echo "##vso[task.setvariable variable=power_state;isOutput=true]$POWER_STATE"
+            name: getVm
+            displayName: 'Get VM details'
+            env:
+              NUTANIX_ENDPOINT: $(NUTANIX_ENDPOINT)
+              NUTANIX_USERNAME: $(NUTANIX_USERNAME)
+              NUTANIX_PASSWORD: $(NUTANIX_PASSWORD)
+              USE_SECONDARY_PRISM: ${{ parameters.USE_SECONDARY_PRISM }}
+              TEST_ENV: ${{ parameters.TEST_ENV }}
+              PRISM_SECONDARY_URL: $(selectPrism.PRISM_SECONDARY_URL)
+
+          - bash: |
+              set -e
+
+              RESPONSE_MSG=""
+
+              POWER_ACTION="${{ parameters.POWER_ACTION }}"
+              CURRENT_POWER_STATE="$(getVm.power_state)"
+              VM_NAME="$(getVm.vm_name)"
+
+              echo "Current power state: $CURRENT_POWER_STATE"
+              echo "Requested action:    $POWER_ACTION"
+
+              ACTION_NEEDED=true
+
+              case "$POWER_ACTION" in
+                ON)
+                  if [ "$CURRENT_POWER_STATE" = "ON" ]; then
+                    ACTION_NEEDED=false
+                    RESPONSE_MSG="${VM_NAME} is already powered ON. No action needed."
+                  fi
+                  ;;
+                OFF)
+                  if [ "$CURRENT_POWER_STATE" = "OFF" ]; then
+                    ACTION_NEEDED=false
+                    RESPONSE_MSG="${VM_NAME} is already powered OFF. No action needed."
+                  fi
+                  ;;
+                RESTART)
+                  if [ "$CURRENT_POWER_STATE" != "ON" ]; then
+                    RESPONSE_MSG="Cannot RESTART ${VM_NAME}: current power state is '$CURRENT_POWER_STATE' (must be ON). Use POWER_ACTION=ON to start the VM."
+                    echo "##vso[task.logissue type=error]❌ $RESPONSE_MSG"
+                    echo "##vso[task.setvariable variable=action_needed;isOutput=true]false"
+                    echo "##vso[task.setvariable variable=RESPONSE_MSG;isOutput=true]$RESPONSE_MSG"
+                    exit 1
+                  fi
+                  ;;
+              esac
+
+              if [ "$ACTION_NEEDED" = "false" ]; then
+                echo "ℹ️  $RESPONSE_MSG"
+                echo "##vso[task.setvariable variable=action_needed;isOutput=true]false"
+                echo "##vso[task.setvariable variable=RESPONSE_MSG;isOutput=true]$RESPONSE_MSG"
+                exit 0
+              fi
+
+              echo "✅ Validation passed: POWER_ACTION '$POWER_ACTION' will be applied"
+              echo "##vso[task.setvariable variable=action_needed;isOutput=true]true"
+              echo "##vso[task.setvariable variable=RESPONSE_MSG;isOutput=true]$RESPONSE_MSG"
+            name: validateAction
+            displayName: 'Validate requested power action vs current state'
+
+          # ----------------------------------------------------------------------------------------------
+          # Aggregate RESPONSE_MSG from all previous steps in this job and re-export it as a job-level
+          # output variable. Always runs so that downstream jobs can read the captured error (if any)
+          # even when an earlier step failed.
+          # ----------------------------------------------------------------------------------------------
+          - bash: |
+              FINAL_MSG=""
+
+              for MSG in \
+                "$SELECT_PRISM_MSG" \
+                "$VALIDATE_PRISM_AUTH_MSG" \
+                "$GET_VM_MSG" \
+                "$VALIDATE_ACTION_MSG"; do
+                case "$MSG" in
+                  '$('*')') continue ;;
+                esac
+                if [ -n "$MSG" ]; then
+                  FINAL_MSG="$MSG"
+                  break
+                fi
+              done
+
+              if [ -n "$FINAL_MSG" ]; then
+                echo "ℹ️ Captured RESPONSE_MSG from previous step(s): $FINAL_MSG"
+              else
+                echo "ℹ️ No RESPONSE_MSG captured in previous steps. RESPONSE_MSG will be empty."
+              fi
+
+              echo "##vso[task.setvariable variable=RESPONSE_MSG;isOutput=true]$FINAL_MSG"
+            name: responseMSG
+            displayName: 'Aggregate RESPONSE_MSG from previous steps'
+            condition: always()
+            env:
+              SELECT_PRISM_MSG: $(selectPrism.RESPONSE_MSG)
+              VALIDATE_PRISM_AUTH_MSG: $(validatePrismAuth.RESPONSE_MSG)
+              GET_VM_MSG: $(getVm.RESPONSE_MSG)
+              VALIDATE_ACTION_MSG: $(validateAction.RESPONSE_MSG)
 
 
-    # ----------------------------------------------------------------------------------------------
-    # 4) Power cycle the VM
-    # ----------------------------------------------------------------------------------------------
-    - job: PowerCycleVM
-      displayName: 'Power Cycle VM'
-      dependsOn:
-        - ValidateSpec
-        - ${{ if eq(parameters.use_cyberArk, true) }}:
-            - CyberArkAuth
-      condition: and(succeeded(), eq(dependencies.ValidateSpec.outputs['validateSpec.spec_is_different'], 'true'))
-      variables:
-        ${{ if eq(parameters.use_cyberArk, true) }}:
-          NUTANIX_USERNAME: $[ dependencies.CyberArkAuth.outputs['retrieveCredentials.NUTANIX_USERNAME'] ]
-          NUTANIX_PASSWORD: $[ dependencies.CyberArkAuth.outputs['retrieveCredentials.NUTANIX_PASSWORD'] ]
-          NUTANIX_ENDPOINT: $[ dependencies.CyberArkAuth.outputs['retrieveCredentials.NUTANIX_ENDPOINT'] ]
-          vm_uuid: $[ dependencies.ValidateSpec.outputs['getVm.vm_uuid'] ]
-          vm_name: $[ dependencies.ValidateSpec.outputs['getVm.vm_name'] ]
-          power_state: $[ dependencies.ValidateSpec.outputs['getVm.power_state'] ]
-        ${{ else }}:
-          NUTANIX_USERNAME: $(PRISM_USERNAME)
-          NUTANIX_PASSWORD: $(PRISM_PASSWORD)
-          NUTANIX_ENDPOINT: $[ dependencies.ValidateSpec.outputs['selectPrism.PRISM_URL'] ]
-          vm_uuid: $[ dependencies.ValidateSpec.outputs['getVm.vm_uuid'] ]
-          vm_name: $[ dependencies.ValidateSpec.outputs['getVm.vm_name'] ]
-          power_state: $[ dependencies.ValidateSpec.outputs['getVm.power_state'] ]
-      steps:
-        - checkout: self
-          clean: true
+      # ----------------------------------------------------------------------------------------------
+      # 4) Apply the requested power action
+      # ----------------------------------------------------------------------------------------------
+      - job: ApplyPowerAction
+        displayName: 'Apply Power Action'
+        dependsOn:
+          - ValidateVm
+          - ${{ if eq(parameters.use_cyberArk, true) }}:
+              - CyberArkAuth
+        condition: and(succeeded(), eq(dependencies.ValidateVm.outputs['validateAction.action_needed'], 'true'))
+        variables:
+          # NUTANIX_ENDPOINT is always taken from the selectPrism step in ValidateVm,
+          # regardless of the credential source — only username/password vary.
+          NUTANIX_ENDPOINT: $[ dependencies.ValidateVm.outputs['selectPrism.PRISM_URL'] ]
+          vm_uuid:     $[ dependencies.ValidateVm.outputs['getVm.vm_uuid'] ]
+          vm_name:     $[ dependencies.ValidateVm.outputs['getVm.vm_name'] ]
+          power_state: $[ dependencies.ValidateVm.outputs['getVm.power_state'] ]
+          ${{ if eq(parameters.use_cyberArk, true) }}:
+            NUTANIX_USERNAME: $[ dependencies.CyberArkAuth.outputs['retrieveCredentials.NUTANIX_USERNAME'] ]
+            NUTANIX_PASSWORD: $[ dependencies.CyberArkAuth.outputs['retrieveCredentials.NUTANIX_PASSWORD'] ]
+          ${{ else }}:
+            NUTANIX_USERNAME: $(PRISM_USERNAME)
+            NUTANIX_PASSWORD: $(PRISM_PASSWORD)
+        steps:
 
-        - bash: |
-            set -e
+          - checkout: self
+            clean: true
 
-            VM_UUID="$(vm_uuid)"
-            POWER_ACTION="${{ parameters.POWER_ACTION }}"
-            INITIAL_POWER_STATE="$(power_state)"
-            API_URL="https://${NUTANIX_ENDPOINT}:9440/api/nutanix/v3"
+          - bash: |
+              set -e
+              source "$(Build.SourcesDirectory)/Scripts/Bash/response_msg_helpers.sh"
 
-            # Map the user-facing action to the Prism v3 set_power_state transition value.
-            case "$POWER_ACTION" in
-              ON)      TRANSITION="ON" ;;
-              OFF)     TRANSITION="ACPI_SHUTDOWN" ;;
-              RESTART) TRANSITION="ACPI_REBOOT" ;;
-              *)
-                echo "##vso[task.logissue type=error]Unsupported POWER_ACTION: $POWER_ACTION"
-                exit 1
-                ;;
-            esac
+              RESPONSE_MSG=""
 
-            echo "========================================="
-            echo "  Power Cycling VM"
-            echo "========================================="
-            echo "  VM UUID:           $VM_UUID"
-            echo "  Initial state:     $INITIAL_POWER_STATE"
-            echo "  Requested action:  $POWER_ACTION (transition=$TRANSITION)"
+              VM_UUID="$(vm_uuid)"
+              VM_NAME="$(vm_name)"
+              POWER_ACTION="${{ parameters.POWER_ACTION }}"
+              API_URL="https://${NUTANIX_ENDPOINT}:9440/api/nutanix/v3"
 
-            echo "##vso[task.setvariable variable=initial_power_state;isOutput=true]$INITIAL_POWER_STATE"
+              # Map user-facing POWER_ACTION → Nutanix v3 transition value.
+              #   ON      → "ON"
+              #   OFF     → "OFF"
+              #   RESTART → "ACPI_REBOOT" (graceful restart; requires guest tools)
+              case "$POWER_ACTION" in
+                ON)      TRANSITION="ON" ; FALLBACK_POWER_STATE="ON"  ;;
+                OFF)     TRANSITION="OFF" ; FALLBACK_POWER_STATE="OFF" ;;
+                RESTART) TRANSITION="ACPI_REBOOT" ; FALLBACK_POWER_STATE="" ;;
+              esac
 
-            echo ">>> Sending power cycle request..."
+              echo "========================================="
+              echo "  Powercycling VM: $VM_NAME"
+              echo "========================================="
+              echo "  Action:     $POWER_ACTION"
+              echo "  Transition: $TRANSITION"
 
-            POWER_RESPONSE=$(curl -s -k -w "\n%{http_code}" \
-              -X POST \
-              -H "Content-Type: application/json" \
-              -u "${NUTANIX_USERNAME}:${NUTANIX_PASSWORD}" \
-              -d "{\"transition\": \"${TRANSITION}\"}" \
-              "${API_URL}/vms/${VM_UUID}/set_power_state")
+              POWER_RESPONSE=$(curl -s -k -w "\n%{http_code}" \
+                -X POST \
+                -H "Content-Type: application/json" \
+                -u "${NUTANIX_USERNAME}:${NUTANIX_PASSWORD}" \
+                -d "{\"transition\": \"${TRANSITION}\"}" \
+                "${API_URL}/vms/${VM_UUID}/set_power_state")
 
-            HTTP_CODE=$(echo "$POWER_RESPONSE" | tail -n1)
-            RESPONSE_BODY=$(echo "$POWER_RESPONSE" | sed '$d')
+              HTTP_CODE=$(echo "$POWER_RESPONSE" | tail -n1)
+              RESPONSE_BODY=$(echo "$POWER_RESPONSE" | sed '$d')
 
-            # Fallback: some Prism deployments don't expose /set_power_state on v3.
-            # The PUT-update fallback only supports ON/OFF directly. For RESTART we
-            # emulate it by issuing OFF then ON via the same fallback path.
-            if [ "$HTTP_CODE" = "404" ]; then
-              echo "ℹ️  set_power_state endpoint not found, falling back to VM update API"
+              # Fallback: some Prism deployments don't expose /set_power_state on v3.
+              # Fallback only works for ON/OFF (the VM update API can't trigger ACPI_REBOOT).
+              if [ "$HTTP_CODE" = "404" ] && [ -n "$FALLBACK_POWER_STATE" ]; then
+                echo "ℹ️  set_power_state endpoint not found, falling back to VM update API"
 
-              do_put_power_state() {
-                local DESIRED_STATE="$1"
-
-                local VM_GET_RESPONSE
                 VM_GET_RESPONSE=$(curl -s -k -w "\n%{http_code}" \
                   -X GET \
                   -H "Content-Type: application/json" \
                   -u "${NUTANIX_USERNAME}:${NUTANIX_PASSWORD}" \
                   "${API_URL}/vms/${VM_UUID}")
 
-                local VM_GET_HTTP VM_GET_BODY
                 VM_GET_HTTP=$(echo "$VM_GET_RESPONSE" | tail -n1)
                 VM_GET_BODY=$(echo "$VM_GET_RESPONSE" | sed '$d')
                 if [ "$VM_GET_HTTP" -lt 200 ] || [ "$VM_GET_HTTP" -ge 300 ]; then
-                  echo "##vso[task.logissue type=error]Fallback GET VM failed (HTTP $VM_GET_HTTP)"
-                  echo "$VM_GET_BODY" | jq '.' || echo "$VM_GET_BODY"
-                  return 1
+                  emit_api_error "Fallback GET VM failed before power transition (HTTP $VM_GET_HTTP)" "$VM_GET_BODY"
+                  exit 1
                 fi
 
-                local FALLBACK_PAYLOAD
-                FALLBACK_PAYLOAD=$(echo "$VM_GET_BODY" | jq ".spec.resources.power_state = \"${DESIRED_STATE}\"" | jq 'del(.status)')
+                FALLBACK_PAYLOAD=$(echo "$VM_GET_BODY" | jq ".spec.resources.power_state = \"${FALLBACK_POWER_STATE}\"" | jq 'del(.status)')
 
-                local PUT_RESPONSE
-                PUT_RESPONSE=$(curl -s -k -w "\n%{http_code}" \
+                POWER_RESPONSE=$(curl -s -k -w "\n%{http_code}" \
                   -X PUT \
                   -H "Content-Type: application/json" \
                   -u "${NUTANIX_USERNAME}:${NUTANIX_PASSWORD}" \
                   -d "$FALLBACK_PAYLOAD" \
                   "${API_URL}/vms/${VM_UUID}")
 
-                FALLBACK_HTTP_CODE=$(echo "$PUT_RESPONSE" | tail -n1)
-                FALLBACK_BODY=$(echo "$PUT_RESPONSE" | sed '$d')
-              }
-
-              if [ "$POWER_ACTION" = "RESTART" ]; then
-                echo ">>> Fallback: powering OFF before powering back ON"
-                do_put_power_state "OFF" || exit 1
-                if [ "$FALLBACK_HTTP_CODE" -lt 200 ] || [ "$FALLBACK_HTTP_CODE" -ge 300 ]; then
-                  echo "##vso[task.logissue type=error]Fallback OFF failed (HTTP $FALLBACK_HTTP_CODE)"
-                  echo "$FALLBACK_BODY" | jq '.' || echo "$FALLBACK_BODY"
-                  exit 1
-                fi
-                OFF_TASK_UUID=$(echo "$FALLBACK_BODY" | jq -r '.status.execution_context.task_uuid // empty')
-                # Wait briefly for the OFF task before issuing ON
-                if [ -n "$OFF_TASK_UUID" ]; then
-                  for i in $(seq 1 60); do
-                    OFF_STATUS=$(curl -s -k -u "${NUTANIX_USERNAME}:${NUTANIX_PASSWORD}" \
-                      "${API_URL}/tasks/${OFF_TASK_UUID}" | jq -r '.status // "UNKNOWN"')
-                    [ "$OFF_STATUS" = "SUCCEEDED" ] && break
-                    [ "$OFF_STATUS" = "FAILED" ] && { echo "##vso[task.logissue type=error]Fallback OFF task failed"; exit 1; }
-                    sleep 5
-                  done
-                fi
-
-                echo ">>> Fallback: powering ON"
-                do_put_power_state "ON" || exit 1
-                HTTP_CODE="$FALLBACK_HTTP_CODE"
-                RESPONSE_BODY="$FALLBACK_BODY"
-              else
-                # ON or OFF
-                do_put_power_state "$POWER_ACTION" || exit 1
-                HTTP_CODE="$FALLBACK_HTTP_CODE"
-                RESPONSE_BODY="$FALLBACK_BODY"
+                HTTP_CODE=$(echo "$POWER_RESPONSE" | tail -n1)
+                RESPONSE_BODY=$(echo "$POWER_RESPONSE" | sed '$d')
+              elif [ "$HTTP_CODE" = "404" ] && [ -z "$FALLBACK_POWER_STATE" ]; then
+                emit_api_error "set_power_state endpoint not available for transition '$TRANSITION' (POWER_ACTION=$POWER_ACTION). Cannot fall back to VM update API for this transition." "$RESPONSE_BODY"
+                exit 1
               fi
-            fi
 
-            if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
-              echo "##vso[task.logissue type=error]Failed to send power cycle request (HTTP $HTTP_CODE)"
-              echo "$RESPONSE_BODY" | jq '.' || echo "$RESPONSE_BODY"
-              exit 1
-            fi
+              if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+                emit_api_error "Failed to send power transition '$TRANSITION' request (HTTP $HTTP_CODE)" "$RESPONSE_BODY"
+                exit 1
+              fi
 
-            TASK_UUID=$(echo "$RESPONSE_BODY" | jq -r '.status.execution_context.task_uuid // empty')
-            if [ -z "$TASK_UUID" ]; then
-              echo "##vso[task.logissue type=error]Power cycle task UUID was not returned"
-              exit 1
-            fi
+              TASK_UUID=$(echo "$RESPONSE_BODY" | jq -r '.status.execution_context.task_uuid // empty')
+              if [ -z "$TASK_UUID" ]; then
+                emit_api_error "Power transition task UUID was not returned" "$RESPONSE_BODY"
+                exit 1
+              fi
 
-            echo "✅ Power cycle request accepted"
-            echo "   Task UUID: $TASK_UUID"
+              echo "✅ Power transition request accepted. Task UUID: $TASK_UUID"
 
-            echo "##vso[task.setvariable variable=task_uuid;isOutput=true]$TASK_UUID"
-            echo "##vso[task.setvariable variable=success;isOutput=true]true"
-          name: powerCycle
-          displayName: 'PowerCycle VM'
-          env:
-            NUTANIX_ENDPOINT: $(NUTANIX_ENDPOINT)
-            NUTANIX_USERNAME: $(NUTANIX_USERNAME)
-            NUTANIX_PASSWORD: $(NUTANIX_PASSWORD)
+              echo "##vso[task.setvariable variable=task_uuid;isOutput=true]$TASK_UUID"
+              echo "##vso[task.setvariable variable=transition;isOutput=true]$TRANSITION"
+              echo "##vso[task.setvariable variable=RESPONSE_MSG;isOutput=true]$RESPONSE_MSG"
+            name: powerAction
+            displayName: 'Send power transition request'
+            env:
+              NUTANIX_ENDPOINT: $(NUTANIX_ENDPOINT)
+              NUTANIX_USERNAME: $(NUTANIX_USERNAME)
+              NUTANIX_PASSWORD: $(NUTANIX_PASSWORD)
 
-        - bash: |
-            set -e
+          - bash: |
+              set -e
+              source "$(Build.SourcesDirectory)/Scripts/Bash/response_msg_helpers.sh"
 
-            TASK_UUID="$(powerCycle.task_uuid)"
-            API_URL="https://${NUTANIX_ENDPOINT}:9440/api/nutanix/v3/tasks/${TASK_UUID}"
-            MAX_ATTEMPTS=60
-            ATTEMPT=0
+              RESPONSE_MSG=""
 
-            echo ">>> Monitoring power cycle task: $TASK_UUID"
+              TASK_UUID="$(powerAction.task_uuid)"
+              VM_NAME="$(vm_name)"
+              POWER_ACTION="${{ parameters.POWER_ACTION }}"
+              API_URL="https://${NUTANIX_ENDPOINT}:9440/api/nutanix/v3/tasks/${TASK_UUID}"
+              MAX_ATTEMPTS=60
+              ATTEMPT=0
 
-            while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+              echo ">>> Monitoring power transition task: $TASK_UUID"
+
+              while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+                RESPONSE=$(curl -s -k \
+                  -X GET \
+                  -H "Content-Type: application/json" \
+                  -u "${NUTANIX_USERNAME}:${NUTANIX_PASSWORD}" \
+                  "$API_URL")
+
+                STATUS=$(echo "$RESPONSE" | jq -r '.status // "UNKNOWN"')
+                PROGRESS=$(echo "$RESPONSE" | jq -r '.progress_message // "In progress..."')
+
+                case $STATUS in
+                  SUCCEEDED)
+                    echo "✅ Power transition task completed successfully!"
+                    echo "   Status: $STATUS"
+                    echo "   Message: $PROGRESS"
+                    case "$POWER_ACTION" in
+                      ON)      RESPONSE_MSG="${VM_NAME} powered ON successfully." ;;
+                      OFF)     RESPONSE_MSG="${VM_NAME} powered OFF successfully." ;;
+                      RESTART) RESPONSE_MSG="${VM_NAME} restarted successfully." ;;
+                    esac
+                    echo "##vso[task.setvariable variable=RESPONSE_MSG;isOutput=true]$RESPONSE_MSG"
+                    echo "##vso[task.setvariable variable=action_success;isOutput=true]true"
+                    echo "##vso[task.setvariable variable=task_still_in_progress;isOutput=true]false"
+                    exit 0
+                    ;;
+                  FAILED)
+                    emit_api_error "Power transition task failed (POWER_ACTION=$POWER_ACTION)" "$RESPONSE" "$TASK_UUID"
+                    echo "##vso[task.setvariable variable=action_success;isOutput=true]false"
+                    echo "##vso[task.setvariable variable=task_still_in_progress;isOutput=true]false"
+                    exit 1
+                    ;;
+                  *)
+                    echo "⏳ Status: $STATUS | Progress: $PROGRESS"
+                    ATTEMPT=$((ATTEMPT + 1))
+                    sleep 5
+                    ;;
+                esac
+              done
+
+              RESPONSE_MSG="Power transition task is still in progress after $((MAX_ATTEMPTS * 5)) seconds. Task UUID: $TASK_UUID. Please check the task status directly in Nutanix Prism to confirm completion. Current status: $STATUS. Progress message: $PROGRESS"
+              echo "##vso[task.logissue type=warning]⚠️ $RESPONSE_MSG"
+
+              echo "##vso[task.setvariable variable=RESPONSE_MSG;isOutput=true]$RESPONSE_MSG"
+              echo "##vso[task.setvariable variable=action_success;isOutput=true]false"
+              echo "##vso[task.setvariable variable=task_still_in_progress;isOutput=true]true"
+              exit 0
+            name: monitorPowerAction
+            displayName: 'Monitor power transition task'
+            condition: and(succeeded(), ne(variables['powerAction.task_uuid'], ''))
+            env:
+              NUTANIX_ENDPOINT: $(NUTANIX_ENDPOINT)
+              NUTANIX_USERNAME: $(NUTANIX_USERNAME)
+              NUTANIX_PASSWORD: $(NUTANIX_PASSWORD)
+
+          - bash: |
+              RESPONSE_MSG=""
+
+              VM_UUID="$(vm_uuid)"
+              API_URL="https://${NUTANIX_ENDPOINT}:9440/api/nutanix/v3/vms/${VM_UUID}"
+
+              echo ">>> Fetching updated VM power state..."
+              sleep 2
+
               RESPONSE=$(curl -s -k \
                 -X GET \
                 -H "Content-Type: application/json" \
                 -u "${NUTANIX_USERNAME}:${NUTANIX_PASSWORD}" \
                 "$API_URL")
 
-              STATUS=$(echo "$RESPONSE" | jq -r '.status // "UNKNOWN"')
-              PROGRESS=$(echo "$RESPONSE" | jq -r '.progress_message // "In progress..."')
+              NEW_POWER_STATE=$(echo "$RESPONSE" | jq -r '.spec.resources.power_state')
 
-              case $STATUS in
-                SUCCEEDED)
-                  echo "✅ Power cycle task completed successfully!"
-                  echo "   Status:  $STATUS"
-                  echo "   Message: $PROGRESS"
-                  exit 0
-                  ;;
-                FAILED)
-                  echo "❌ Power cycle task failed!"
-                  echo "$RESPONSE" | jq '.'
-                  exit 1
-                  ;;
-                *)
-                  echo "⏳ Status: $STATUS | Progress: $PROGRESS"
-                  ATTEMPT=$((ATTEMPT + 1))
-                  sleep 5
-                  ;;
-              esac
-            done
+              echo ""
+              echo "========================================="
+              echo "  VM Power State Updated"
+              echo "========================================="
+              echo "Power State: $NEW_POWER_STATE"
+              echo "========================================="
 
-            echo "⚠️  Task monitoring timeout after $((MAX_ATTEMPTS * 5)) seconds"
-            echo "   Task may still be processing. Check task status: $TASK_UUID"
-            exit 0
-          displayName: 'Monitor PowerCycle task'
-          condition: and(succeeded(), ne(variables['powerCycle.task_uuid'], ''))
-          env:
-            NUTANIX_ENDPOINT: $(NUTANIX_ENDPOINT)
-            NUTANIX_USERNAME: $(NUTANIX_USERNAME)
-            NUTANIX_PASSWORD: $(NUTANIX_PASSWORD)
+              echo "##vso[task.setvariable variable=new_power_state;isOutput=true]$NEW_POWER_STATE"
+              echo "##vso[task.setvariable variable=RESPONSE_MSG;isOutput=true]$RESPONSE_MSG"
+            name: verifyPowerState
+            displayName: 'Verify power state'
+            env:
+              NUTANIX_ENDPOINT: $(NUTANIX_ENDPOINT)
+              NUTANIX_USERNAME: $(NUTANIX_USERNAME)
+              NUTANIX_PASSWORD: $(NUTANIX_PASSWORD)
 
-        - bash: |
-            set -e
+          # ----------------------------------------------------------------------------------------------
+          # Aggregate RESPONSE_MSG from all previous steps in this job and re-export it as a job-level
+          # output variable. Always runs so that downstream jobs can read the captured error (if any)
+          # even when an earlier step failed.
+          # ----------------------------------------------------------------------------------------------
+          - bash: |
+              FINAL_MSG=""
 
-            VM_UUID="$(vm_uuid)"
-            POWER_ACTION="${{ parameters.POWER_ACTION }}"
-            API_URL="https://${NUTANIX_ENDPOINT}:9440/api/nutanix/v3/vms/${VM_UUID}"
+              for MSG in \
+                "$POWER_ACTION_MSG" \
+                "$MONITOR_MSG" \
+                "$VERIFY_MSG"; do
+                case "$MSG" in
+                  '$('*')') continue ;;
+                esac
+                if [ -n "$MSG" ]; then
+                  FINAL_MSG="$MSG"
+                  break
+                fi
+              done
 
-            # The expected end state for ON/RESTART is ON, for OFF it is OFF.
-            case "$POWER_ACTION" in
-              ON|RESTART) EXPECTED_STATE="ON" ;;
-              OFF)        EXPECTED_STATE="OFF" ;;
-            esac
+              echo "##vso[task.setvariable variable=RESPONSE_MSG;isOutput=true]$FINAL_MSG"
+            name: responseMSG
+            displayName: 'Aggregate RESPONSE_MSG'
+            condition: always()
+            env:
+              POWER_ACTION_MSG: $(powerAction.RESPONSE_MSG)
+              MONITOR_MSG:      $(monitorPowerAction.RESPONSE_MSG)
+              VERIFY_MSG:       $(verifyPowerState.RESPONSE_MSG)
 
-            echo ">>> Verifying VM power state (expected: $EXPECTED_STATE)..."
-            sleep 2
+          - bash: |
+              SUMMARY_FILE="$(Build.ArtifactStagingDirectory)/vm-powercycle-summary.md"
+              mkdir -p "$(Build.ArtifactStagingDirectory)"
 
-            RESPONSE=$(curl -s -k \
-              -X GET \
-              -H "Content-Type: application/json" \
-              -u "${NUTANIX_USERNAME}:${NUTANIX_PASSWORD}" \
-              "$API_URL")
+              VM_NAME="$(vm_name)"
+              VM_UUID="$(vm_uuid)"
+              POWER_STATE_BEFORE="$(power_state)"
+              POWER_STATE_AFTER="$(verifyPowerState.new_power_state)"
+              [ -z "$POWER_STATE_AFTER" ] && POWER_STATE_AFTER="-"
+              POWER_ACTION="${{ parameters.POWER_ACTION }}"
+              TRANSITION="$(powerAction.transition)"
+              TASK_UUID="$(powerAction.task_uuid)"
 
-            CURRENT_POWER_STATE=$(echo "$RESPONSE" | jq -r '.spec.resources.power_state')
+              STATUS_LINE="❌ Powercycle Failed"
+              if [ "$(monitorPowerAction.action_success)" = "true" ]; then
+                STATUS_LINE="✅ Powercycle Successful"
+              fi
 
-            echo "========================================="
-            echo "  VM Power State Updated"
-            echo "========================================="
-            echo "  Current power state: $CURRENT_POWER_STATE"
-            echo "  Expected:            $EXPECTED_STATE"
-            echo "========================================="
+              PROP_W=16
+              BEFORE_W=0
+              AFTER_W=0
+              for v in "$VM_NAME" "$VM_UUID" "$POWER_STATE_BEFORE" "-"; do
+                [ ${#v} -gt $BEFORE_W ] && BEFORE_W=${#v}
+              done
+              for v in "$VM_NAME" "$VM_UUID" "$POWER_STATE_AFTER" "$POWER_ACTION" "$TRANSITION" "$TASK_UUID"; do
+                [ ${#v} -gt $AFTER_W ] && AFTER_W=${#v}
+              done
+              [ $BEFORE_W -lt 6 ] && BEFORE_W=6
+              [ $AFTER_W  -lt 5 ] && AFTER_W=5
 
-            echo "##vso[task.setvariable variable=final_power_state;isOutput=true]$CURRENT_POWER_STATE"
+              ROW_FMT="| %-${PROP_W}s | %-${BEFORE_W}s | %-${AFTER_W}s |\n"
+              SEP_PROP=$(printf '%*s' $PROP_W   '' | tr ' ' '-')
+              SEP_BEF=$(printf  '%*s' $BEFORE_W '' | tr ' ' '-')
+              SEP_AFT=$(printf  '%*s' $AFTER_W  '' | tr ' ' '-')
 
-            if [ "$CURRENT_POWER_STATE" != "$EXPECTED_STATE" ]; then
-              echo "##vso[task.logissue type=warning]VM power state ($CURRENT_POWER_STATE) does not match expected ($EXPECTED_STATE) yet. It may still be transitioning."
-            fi
-          name: verify
-          displayName: 'Verify PowerCycle'
-          env:
-            NUTANIX_ENDPOINT: $(NUTANIX_ENDPOINT)
-            NUTANIX_USERNAME: $(NUTANIX_USERNAME)
-            NUTANIX_PASSWORD: $(NUTANIX_PASSWORD)
+              {
+                echo "## VM Powercycle Summary"
+                echo
+                printf "$ROW_FMT" "Property"     "Before" "After"
+                printf "|-%s-|-%s-|-%s-|\n" "$SEP_PROP" "$SEP_BEF" "$SEP_AFT"
+                printf "$ROW_FMT" "VM Name"      "$VM_NAME"             "$VM_NAME"
+                printf "$ROW_FMT" "VM UUID"      "$VM_UUID"             "$VM_UUID"
+                printf "$ROW_FMT" "Power State"  "$POWER_STATE_BEFORE"  "$POWER_STATE_AFTER"
+                printf "$ROW_FMT" "Power Action" "-"                    "$POWER_ACTION"
+                printf "$ROW_FMT" "Transition"   "-"                    "$TRANSITION"
+                printf "$ROW_FMT" "Task UUID"    "-"                    "$TASK_UUID"
+                echo
+                echo "### Status"
+                echo "$STATUS_LINE"
+              } > "$SUMMARY_FILE"
 
-        - bash: |
-            SUMMARY_FILE="$(Build.ArtifactStagingDirectory)/vm-powercycle-summary.md"
-            mkdir -p "$(Build.ArtifactStagingDirectory)"
+              echo "Summary written to $SUMMARY_FILE"
+              cat "$SUMMARY_FILE"
+            displayName: 'Job Summary'
+            condition: always()
 
-            VM_NAME="$(vm_name)"
-            VM_UUID="$(vm_uuid)"
-            POWER_ACTION="${{ parameters.POWER_ACTION }}"
-            INITIAL_STATE="$(powerCycle.initial_power_state)"
-            FINAL_STATE="$(verify.final_power_state)"
-            TASK_UUID="$(powerCycle.task_uuid)"
 
-            STATUS_LINE="❌ Power Cycle Failed"
-            if [ "$(powerCycle.success)" = "true" ]; then
-              STATUS_LINE="✅ Power Cycle Successful"
-            fi
+      # ----------------------------------------------------------------------------------------------
+      # 5) Aggregate RESPONSE_MSG from all previous jobs and emit the final pipeline message.
+      #    Always runs (even if a previous job failed or was skipped) so that the pipeline always
+      #    produces a single authoritative response message that downstream consumers (SNOW, GH
+      #    Actions, etc.) can read from this job's `finalMessage.RESPONSE_MSG` output variable.
+      # ----------------------------------------------------------------------------------------------
+      - job: FinalMessage
+        displayName: 'Final Pipeline Response Message'
+        dependsOn:
+          - ValidateInputParameters
+          - ${{ if eq(parameters.use_cyberArk, true) }}:
+              - CyberArkAuth
+          - ValidateVm
+          - ApplyPowerAction
+        condition: always()
+        variables:
+          VALIDATE_INPUT_MSG:    $[ dependencies.ValidateInputParameters.outputs['validateInput.RESPONSE_MSG'] ]
+          VALIDATE_VM_MSG:       $[ dependencies.ValidateVm.outputs['responseMSG.RESPONSE_MSG'] ]
+          APPLY_ACTION_MSG:      $[ dependencies.ApplyPowerAction.outputs['responseMSG.RESPONSE_MSG'] ]
+          VALIDATE_INPUT_RESULT: $[ dependencies.ValidateInputParameters.result ]
+          VALIDATE_VM_RESULT:    $[ dependencies.ValidateVm.result ]
+          APPLY_ACTION_RESULT:   $[ dependencies.ApplyPowerAction.result ]
+          ${{ if eq(parameters.use_cyberArk, true) }}:
+            CYBERARK_RESULT:     $[ dependencies.CyberArkAuth.result ]
+          ${{ else }}:
+            CYBERARK_RESULT:     'NotApplicable'
+          ACTION_NEEDED:         $[ dependencies.ValidateVm.outputs['validateAction.action_needed'] ]
+        steps:
+          - bash: |
+              VALIDATE_INPUT_MSG="${VALIDATE_INPUT_MSG:-}"
+              VALIDATE_VM_MSG="${VALIDATE_VM_MSG:-}"
+              APPLY_ACTION_MSG="${APPLY_ACTION_MSG:-}"
+              VALIDATE_INPUT_RESULT="${VALIDATE_INPUT_RESULT:-Unknown}"
+              VALIDATE_VM_RESULT="${VALIDATE_VM_RESULT:-Unknown}"
+              APPLY_ACTION_RESULT="${APPLY_ACTION_RESULT:-Unknown}"
+              CYBERARK_RESULT="${CYBERARK_RESULT:-NotApplicable}"
+              ACTION_NEEDED="${ACTION_NEEDED:-}"
 
-            # Compute column widths dynamically so the table always lines up.
-            PROP_W=16
-            BEFORE_W=0
-            AFTER_W=0
-            for v in "$VM_NAME" "$VM_UUID" "$INITIAL_STATE" "$POWER_ACTION" "-"; do
-              [ ${#v} -gt $BEFORE_W ] && BEFORE_W=${#v}
-            done
-            for v in "$VM_NAME" "$VM_UUID" "$FINAL_STATE" "$POWER_ACTION" "$TASK_UUID"; do
-              [ ${#v} -gt $AFTER_W ] && AFTER_W=${#v}
-            done
-            [ $BEFORE_W -lt 6 ] && BEFORE_W=6
-            [ $AFTER_W  -lt 5 ] && AFTER_W=5
+              echo "========================================="
+              echo "  Aggregating Final Pipeline Response"
+              echo "========================================="
+              echo "ValidateInputParameters result : $VALIDATE_INPUT_RESULT"
+              echo "CyberArkAuth result            : $CYBERARK_RESULT"
+              echo "ValidateVm result              : $VALIDATE_VM_RESULT"
+              echo "ApplyPowerAction result        : $APPLY_ACTION_RESULT"
+              echo "action_needed                  : ${ACTION_NEEDED:-<not set>}"
+              echo "-----------------------------------------"
+              echo "ValidateInputParameters MSG    : $VALIDATE_INPUT_MSG"
+              echo "ValidateVm MSG                 : $VALIDATE_VM_MSG"
+              echo "ApplyPowerAction MSG           : $APPLY_ACTION_MSG"
+              echo "-----------------------------------------"
 
-            ROW_FMT="| %-${PROP_W}s | %-${BEFORE_W}s | %-${AFTER_W}s |\n"
-            SEP_PROP=$(printf '%*s' $PROP_W   '' | tr ' ' '-')
-            SEP_BEF=$(printf  '%*s' $BEFORE_W '' | tr ' ' '-')
-            SEP_AFT=$(printf  '%*s' $AFTER_W  '' | tr ' ' '-')
+              FINAL_MSG=""
 
-            {
-              echo "## VM Power Cycle Summary"
-              echo
-              printf "$ROW_FMT" "Property" "Before" "After"
-              printf "|-%s-|-%s-|-%s-|\n" "$SEP_PROP" "$SEP_BEF" "$SEP_AFT"
-              printf "$ROW_FMT" "VM Name"        "$VM_NAME"       "$VM_NAME"
-              printf "$ROW_FMT" "VM UUID"        "$VM_UUID"       "$VM_UUID"
-              printf "$ROW_FMT" "Power State"    "$INITIAL_STATE" "$FINAL_STATE"
-              printf "$ROW_FMT" "Requested"      "-"              "$POWER_ACTION"
-              printf "$ROW_FMT" "Task UUID"      "-"              "$TASK_UUID"
-              echo
-              echo "### Status"
-              echo "$STATUS_LINE"
-            } > "$SUMMARY_FILE"
+              # 1) First non-empty message wins. Jobs are listed in execution order so an
+              #    upstream failure (which short-circuits later jobs) surfaces its own message.
+              for MSG in \
+                "$VALIDATE_INPUT_MSG" \
+                "$VALIDATE_VM_MSG" \
+                "$APPLY_ACTION_MSG"; do
+                if [ -n "$MSG" ]; then
+                  FINAL_MSG="$MSG"
+                  break
+                fi
+              done
 
-            echo "Summary written to $SUMMARY_FILE"
-            cat "$SUMMARY_FILE"
-          displayName: 'Job Summary'
-          condition: always()
+              # 2) Fallbacks for paths where no upstream step set RESPONSE_MSG.
+              if [ -z "$FINAL_MSG" ]; then
+                if [ "$VALIDATE_INPUT_RESULT" != "Succeeded" ] \
+                   && [ "$VALIDATE_INPUT_RESULT" != "SucceededWithIssues" ]; then
+                  FINAL_MSG="ValidateInputParameters job ended with status '$VALIDATE_INPUT_RESULT' and no response message. Check job logs."
+                elif [ "$CYBERARK_RESULT" = "Failed" ] || [ "$CYBERARK_RESULT" = "Canceled" ]; then
+                  FINAL_MSG="CyberArkAuth job ended with status '$CYBERARK_RESULT'. Nutanix credentials could not be retrieved."
+                elif [ "$VALIDATE_VM_RESULT" != "Succeeded" ] \
+                     && [ "$VALIDATE_VM_RESULT" != "SucceededWithIssues" ]; then
+                  FINAL_MSG="ValidateVm job ended with status '$VALIDATE_VM_RESULT' and no response message. Check job logs."
+                elif [ "$ACTION_NEEDED" = "false" ]; then
+                  FINAL_MSG="No power action needed. VM is already in the requested power state."
+                elif [ "$APPLY_ACTION_RESULT" = "Skipped" ] || [ "$APPLY_ACTION_RESULT" = "Canceled" ]; then
+                  FINAL_MSG="ApplyPowerAction job was $APPLY_ACTION_RESULT. No action performed."
+                elif [ "$APPLY_ACTION_RESULT" = "Succeeded" ] \
+                     || [ "$APPLY_ACTION_RESULT" = "SucceededWithIssues" ]; then
+                  FINAL_MSG="Pipeline completed successfully."
+                else
+                  FINAL_MSG="Pipeline finished with no captured response message (ApplyPowerAction='$APPLY_ACTION_RESULT'). Check job logs."
+                fi
+              fi
+
+              echo "========================================="
+              echo "  FINAL PIPELINE RESPONSE MESSAGE"
+              echo "========================================="
+              echo "$FINAL_MSG"
+              echo "========================================="
+
+              echo "##vso[task.setvariable variable=RESPONSE_MSG;isOutput=true]$FINAL_MSG"
+            name: finalMessage
+            displayName: 'Compute and print final RESPONSE_MSG'

@@ -1395,3 +1395,4 @@ stages:
               echo "##vso[task.setvariable variable=RESPONSE_MSG;isOutput=true]$FINAL_MSG"
             name: finalMessage
             displayName: 'Compute and print final RESPONSE_MSG'
+
